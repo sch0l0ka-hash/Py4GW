@@ -1,1 +1,0 @@
-stubs are files necessary for code completion with Intellisense, add them to your IDE to handle the libraries
