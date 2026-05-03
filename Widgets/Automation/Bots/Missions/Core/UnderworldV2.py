@@ -165,29 +165,29 @@ FOUR_HORSEMEN_HOLD_POSITION: Vec2f = Vec2f(11510.0, -18234.0)
 FOUR_HORSEMEN_LAB_RETURN_POSITION: Vec2f = Vec2f(-5782.0, 12819.0)
 
 # Hero/follower flag spread used at the pre-position before taking the
-# Four Horsemen quest. Legacy bot spreads the 7 hero flags around
-# (13473, -12091) to fan the team out while waiting for HeroAI to settle.
+# Four Horsemen quest. All 7 heroes are stacked onto the same spot so the
+# team stays together while HeroAI / followers settle.
 FOUR_HORSEMEN_PRE_FLAG_POINTS: list[Vec2f] = [
-    Vec2f(13432.0, -12100.0),
-    Vec2f(13246.0, -12440.0),
-    Vec2f(13072.0, -12188.0),
-    Vec2f(13216.0, -11841.0),
-    Vec2f(13639.0, -11866.0),
-    Vec2f(13745.0, -12151.0),
-    Vec2f(13520.0, -12436.0),
+    Vec2f(13621.0, -11797.0),
+    Vec2f(13621.0, -11797.0),
+    Vec2f(13621.0, -11797.0),
+    Vec2f(13621.0, -11797.0),
+    Vec2f(13621.0, -11797.0),
+    Vec2f(13621.0, -11797.0),
+    Vec2f(13621.0, -11797.0),
 ]
 
-# Hero/follower flag spread used during the Horsemen hold. The legacy bot
-# spreads all 7 hero flags onto the same hold spot so the team stacks on
-# the leader and never wanders off.
+# Hero/follower flag spread used during the Horsemen hold. All 7 heroes
+# are stacked onto the same hold spot so the team stays together while
+# waiting for the quest to complete.
 FOUR_HORSEMEN_HOLD_FLAG_POINTS: list[Vec2f] = [
-    FOUR_HORSEMEN_HOLD_POSITION,
-    FOUR_HORSEMEN_HOLD_POSITION,
-    FOUR_HORSEMEN_HOLD_POSITION,
-    FOUR_HORSEMEN_HOLD_POSITION,
-    FOUR_HORSEMEN_HOLD_POSITION,
-    FOUR_HORSEMEN_HOLD_POSITION,
-    FOUR_HORSEMEN_HOLD_POSITION,
+    Vec2f(11232.0, -18241.0),
+    Vec2f(11232.0, -18241.0),
+    Vec2f(11232.0, -18241.0),
+    Vec2f(11232.0, -18241.0),
+    Vec2f(11232.0, -18241.0),
+    Vec2f(11232.0, -18241.0),
+    Vec2f(11232.0, -18241.0),
 ]
 
 
@@ -684,7 +684,7 @@ def _build_four_horsemen_tree() -> BehaviorTree:
                     FOUR_HORSEMEN_PRE_FLAG_POINTS,
                     name="SpreadFourHorsemenPreFlags",
                 ).root,
-                BT.Wait(10_000).root,
+                #BT.Wait(10_000).root,
                 # Phase 2: take the Four Horsemen quest from the Chaos Planes Reaper.
                 BT.Move([FOUR_HORSEMEN_NPC_POSITION], pause_on_combat=True).root,
                 BT.TargetAndDialogByModelID(
@@ -693,10 +693,12 @@ def _build_four_horsemen_tree() -> BehaviorTree:
                 # 32s warm-up so HeroAI / followers settle before the TP loop.
                 BT.Wait(32_000).root,
                 # Phase 3: TP loop via Labyrinth to spawn the Horsemen.
+                _clear_party_flags(name="ClearFourHorsemenFlags").root,
                 BT.TargetAndDialogByModelID(
                     REAPER_OF_THE_CHAOS_PLANES_MODEL_ID, 0x8D
                 ).root,
-                BT.Move([FOUR_HORSEMEN_LAB_RETURN_POSITION], pause_on_combat=True).root,
+                #BT.Move([FOUR_HORSEMEN_LAB_RETURN_POSITION], pause_on_combat=True).root,
+                BT.Wait(2_000).root,
                 BT.TargetAndDialogByModelID(
                     REAPER_OF_THE_LABYRINTH_MODEL_ID, 0x8B
                 ).root,
@@ -707,7 +709,7 @@ def _build_four_horsemen_tree() -> BehaviorTree:
                     FOUR_HORSEMEN_HOLD_FLAG_POINTS,
                     name="SpreadFourHorsemenHoldFlags",
                 ).root,
-                BT.Move([FOUR_HORSEMEN_HOLD_POSITION], pause_on_combat=True).root,
+                BT.Move([FOUR_HORSEMEN_HOLD_FLAG_POINTS[0]], pause_on_combat=True).root,
                 _wait_until_active_quest_completed(
                     name="WaitFourHorsemenComplete",
                 ).root,
