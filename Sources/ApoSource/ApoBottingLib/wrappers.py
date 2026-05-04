@@ -207,17 +207,8 @@ def WaitUntilCharacterSelect(timeout_ms: int = 45000) -> BehaviorTree:
 
 
 #region Movement
-def Move(
-    pos: PointOrPath,
-    pause_on_combat: bool = True,
-    tolerance: float = 150.0,
-) -> BehaviorTree:
-    return RoutinesBT.Movement.MovePath(
-        pos=pos,
-        pause_on_combat=pause_on_combat,
-        tolerance=tolerance,
-        log=False,
-    )
+def Move(pos: PointOrPath,pause_on_combat: bool = True,tolerance: float = 150.0,) -> BehaviorTree:
+    return RoutinesBT.Movement.MovePath(pos=pos,pause_on_combat=pause_on_combat,tolerance=tolerance,log=False,)
 
 def MoveDirect(pos: PointOrPath, pause_on_combat: bool = True) -> BehaviorTree:
     return RoutinesBT.Movement.MoveDirect(PointPath.as_path(pos), pause_on_combat=pause_on_combat, log=False)
