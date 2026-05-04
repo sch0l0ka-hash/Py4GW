@@ -645,6 +645,9 @@ def Move(
     pos: PointOrPath,
     pause_on_combat: bool = True,
     tolerance: float = DEFAULT_MOVE_TOLERANCE,
+    combat_range: float | None = None,
+    wait_party_behind: bool = False,
+    wait_party_behind_range: float = 3500.0,
 ) -> BehaviorTree:
     return _sequence_from_points(
         "MovePath",
@@ -654,6 +657,9 @@ def Move(
             y=point.y,
             tolerance=tolerance,
             pause_on_combat=pause_on_combat,
+            combat_range=combat_range,
+            wait_party_behind=wait_party_behind,
+            wait_party_behind_range=wait_party_behind_range,
             log=False,
         ),
     )

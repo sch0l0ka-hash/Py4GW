@@ -355,13 +355,23 @@ def _wait_until_no_alive_model(
     for wave_index in range(1, wave_count + 1):
         children.append(_build_single_wave(wave_index))
         if wave_index < wave_count:
-            # Brief pause + nudge back to the hold position before the next
-            # wave, so freshly spawned Mindblades are still detected.
+            # Brief pause before the next wave. WaitNode returns FAILURE on
+            # timeout, so wrap it in a Selector with a SUCCESS fallback so the
+            # parent SequenceNode is not terminated by that FAILURE.
             children.append(
-                BehaviorTree.WaitNode(
-                    check_fn=lambda: BehaviorTree.NodeState.RUNNING,
-                    timeout_ms=max(1, int(delay_between_waves_ms)),
+                BehaviorTree.SelectorNode(
                     name=f"{name}::WaveDelay{wave_index}",
+                    children=[
+                        BehaviorTree.WaitNode(
+                            check_fn=lambda: BehaviorTree.NodeState.RUNNING,
+                            timeout_ms=max(1, int(delay_between_waves_ms)),
+                            name=f"{name}::WaveDelayWait{wave_index}",
+                        ),
+                        BehaviorTree.ActionNode(
+                            name=f"{name}::WaveDelayDone{wave_index}",
+                            action_fn=lambda node: BehaviorTree.NodeState.SUCCESS,
+                        ),
+                    ],
                 )
             )
             children.append(
@@ -485,6 +495,95 @@ def _wait_until_no_mindblades(
     )
 
 
+def _move_with_danger_range(
+    path: list[Vec2f],
+    *,
+    danger_range: float = 400.0,
+    tolerance: float = 150.0,
+    waypoint_timeout_ms: float = 20_000.0,
+    name: str = "MoveWithDangerRange",
+) -> BehaviorTree:
+    """Move along ``path`` using direct Player.Move commands, pausing
+    whenever any alive enemy is within ``danger_range`` units.
+
+    Unlike BT.Move, this node NEVER checks COMBAT_ACTIVE or IsCasting –
+    the sole pause criterion is enemy proximity.  This lets the bot walk
+    through the HeroAI aggro ring and only stop when enemies are genuinely
+    close.  Each waypoint has ``waypoint_timeout_ms`` as a skip-guard so
+    a permanently blocked waypoint never stalls the whole run."""
+    import time
+
+    DANGER_RANGE_SQ = danger_range * danger_range
+    MOVE_INTERVAL_MS = 200.0   # re-issue move command at most every 200 ms
+
+    def _make_wp_node(point: Vec2f, wp_index: int) -> BehaviorTree.Node:
+        state: dict = {"start": None, "last_move": None}
+
+        def _tick(node: BehaviorTree.Node) -> BehaviorTree.NodeState:
+            now_ms = time.monotonic() * 1000.0
+            if state["start"] is None:
+                state["start"] = now_ms
+
+            # Timeout: skip this waypoint and keep the sequence moving.
+            if waypoint_timeout_ms > 0 and (now_ms - state["start"]) >= waypoint_timeout_ms:
+                state["start"] = None
+                state["last_move"] = None
+                return BehaviorTree.NodeState.SUCCESS
+
+            try:
+                px, py = Player.GetXY()
+            except Exception:
+                return BehaviorTree.NodeState.RUNNING
+
+            # Within tolerance → waypoint reached.
+            dx = point.x - px
+            dy = point.y - py
+            if dx * dx + dy * dy <= tolerance * tolerance:
+                state["start"] = None
+                state["last_move"] = None
+                return BehaviorTree.NodeState.SUCCESS
+
+            # Danger check: pause without issuing a move if enemies are close.
+            in_danger = False
+            try:
+                for aid in AgentArray.GetEnemyArray():
+                    if Agent.IsAlive(aid):
+                        ax, ay = Agent.GetXY(aid)
+                        ex = ax - px
+                        ey = ay - py
+                        if ex * ex + ey * ey <= DANGER_RANGE_SQ:
+                            in_danger = True
+                            break
+            except Exception:
+                pass
+
+            if in_danger:
+                return BehaviorTree.NodeState.RUNNING
+
+            # Issue a throttled move command toward the waypoint.
+            last = state["last_move"]
+            if last is None or (now_ms - last) >= MOVE_INTERVAL_MS:
+                try:
+                    Player.Move(point.x, point.y)
+                except Exception:
+                    pass
+                state["last_move"] = now_ms
+
+            return BehaviorTree.NodeState.RUNNING
+
+        return BehaviorTree.ActionNode(
+            name=f"{name}::Wp{wp_index}",
+            action_fn=_tick,
+        )
+
+    return BehaviorTree(
+        BehaviorTree.SequenceNode(
+            name=name,
+            children=[_make_wp_node(p, i) for i, p in enumerate(path)],
+        )
+    )
+
+
 # ╔══════════════════════════════════════════════════════════════════
 # ║                       PLANNER STEP BUILDERS
 # ╠══════════════════════════════════════════════════════════════════
@@ -542,8 +641,10 @@ def _build_chamber_tree() -> BehaviorTree:
         BehaviorTree.SequenceNode(
             name="Chamber",
             children=[
+                BT.WaitUntilOnExplorable(timeout_ms=60_000).root,
+                BT.Move([Vec2f(281,7229)], pause_on_combat=True, wait_party_behind=True).root,
                 BT.MoveAndAutoDialogByModelID(LOST_SOUL_MODEL_ID).root,
-                BT.Move(CHAMBER_PATH, pause_on_combat=True).root,
+                BT.Move(CHAMBER_PATH, pause_on_combat=True, wait_party_behind=True).root,
                 # Accept "Clear the Chamber" Quest Reward
                 BT.MoveAndAutoDialogByModelID(REAPER_OF_THE_LABYRINTH_MODEL_ID).root,
                 # Take "Restoring Grenth's Monuments" quest from the same Reaper.
@@ -555,12 +656,14 @@ def _build_chamber_tree() -> BehaviorTree:
 
 def _build_restore_mountains_tree() -> BehaviorTree:
     """Restore the Mountains: walk the perimeter path to clear the
-    Mountains spawns for the "Restoring Grenth's Monuments" quest."""
+    Mountains spawns for the "Restoring Grenth's Monuments" quest.
+    Movement pauses when any alive enemy enters 400 range (tighter than
+    the default HeroAI aggro bubble)."""
     return BehaviorTree(
         BehaviorTree.SequenceNode(
             name="RestoreMountains",
             children=[
-                BT.Move(RESTORE_MOUNTAINS_PATH, pause_on_combat=True).root,
+                BT.Move(RESTORE_MOUNTAINS_PATH, pause_on_combat=True, combat_range=400.0, wait_party_behind=True).root,
             ],
         )
     )
@@ -574,8 +677,9 @@ def _build_demon_assassin_tree() -> BehaviorTree:
         BehaviorTree.SequenceNode(
             name="DemonAssassin",
             children=[
+                BT.Move([Vec2f(-8250,-5237)], pause_on_combat=True, wait_party_behind=True).root,
                 BT.TargetAndDialogByModelID(REAPER_OF_THE_MOUNTAINS_MODEL_ID, 0x806801).root,
-                BT.Move(DEMON_ASSASSIN_PATH, pause_on_combat=True).root,
+                BT.Move(DEMON_ASSASSIN_PATH, pause_on_combat=True, wait_party_behind=True).root,
                 _wait_until_active_quest_completed(
                     name="WaitDemonAssassinComplete",
                 ).root,
@@ -597,7 +701,7 @@ def _build_restore_chaos_planes_tree() -> BehaviorTree:
                     "banished dream rider",
                     name="Blacklist Banished Dream Rider",
                 ).root,
-                BT.Move(RESTORE_CHAOS_PLANES_PATH, pause_on_combat=True).root,
+                BT.Move(RESTORE_CHAOS_PLANES_PATH, pause_on_combat=True, wait_party_behind=True).root,
                 _unblacklist_enemy_name(
                     "banished dream rider",
                     name="Unblacklist Banished Dream Rider",
@@ -610,6 +714,7 @@ def _build_restore_chaos_planes_tree() -> BehaviorTree:
                 BT.Move(
                     [CHAOS_PLANES_MINDBLADE_HOLD_POSITION_2],
                     pause_on_combat=True,
+                    wait_party_behind=True,
                 ).root,
                 _wait_until_no_mindblades(
                     name="WaitNoMindblades2",
@@ -677,7 +782,7 @@ def _build_four_horsemen_tree() -> BehaviorTree:
             name="FourHorsemen",
             children=[
                 # Phase 1: pre-position before talking to the Reaper.
-                BT.Move([FOUR_HORSEMEN_PRE_POSITION], pause_on_combat=True).root,
+                BT.Move([FOUR_HORSEMEN_PRE_POSITION], pause_on_combat=True, wait_party_behind=True).root,
                 # Spread hero flags around the pre-position so the team fans
                 # out while HeroAI / followers settle (mirrors legacy 10s wait).
                 _spread_party_flags(
@@ -686,7 +791,7 @@ def _build_four_horsemen_tree() -> BehaviorTree:
                 ).root,
                 #BT.Wait(10_000).root,
                 # Phase 2: take the Four Horsemen quest from the Chaos Planes Reaper.
-                BT.Move([FOUR_HORSEMEN_NPC_POSITION], pause_on_combat=True).root,
+                BT.Move([FOUR_HORSEMEN_NPC_POSITION], pause_on_combat=True, wait_party_behind=True).root,
                 BT.TargetAndDialogByModelID(
                     REAPER_OF_THE_CHAOS_PLANES_MODEL_ID, 0x806A01
                 ).root,
@@ -709,7 +814,7 @@ def _build_four_horsemen_tree() -> BehaviorTree:
                     FOUR_HORSEMEN_HOLD_FLAG_POINTS,
                     name="SpreadFourHorsemenHoldFlags",
                 ).root,
-                BT.Move([FOUR_HORSEMEN_HOLD_FLAG_POINTS[0]], pause_on_combat=True).root,
+                BT.Move([FOUR_HORSEMEN_HOLD_FLAG_POINTS[0]], pause_on_combat=True, wait_party_behind=True).root,
                 _wait_until_active_quest_completed(
                     name="WaitFourHorsemenComplete",
                 ).root,
@@ -717,7 +822,7 @@ def _build_four_horsemen_tree() -> BehaviorTree:
                 # reward dialog.
                 _clear_party_flags(name="ClearFourHorsemenFlags").root,
                 # Phase 5: take the quest reward from the Reaper of the Chaos Planes.
-                BT.Move([FOUR_HORSEMEN_NPC_POSITION], pause_on_combat=True).root,
+                BT.Move([FOUR_HORSEMEN_NPC_POSITION], pause_on_combat=True, wait_party_behind=True).root,
                 BT.TargetAndDialogByModelID(
                     REAPER_OF_THE_CHAOS_PLANES_MODEL_ID, 0x806A07
                 ).root,
@@ -734,6 +839,48 @@ def _build_dhuum_tree() -> BehaviorTree:
 def _build_finalize_run_tree() -> BehaviorTree:
     """Quest reward, leave UW, return to ToA."""
     return _todo_step("FinalizeRun")
+
+
+def _build_loot_pause_service() -> BehaviorTree:
+    """Service tree that sets LOOT_PAUSE=True in the blackboard whenever
+    there are lootable items nearby and the party is not in combat.
+
+    _Move() uses pause_flag_key='LOOT_PAUSE' so this service can stop
+    movement mid-path. Because HeroAI's _tick_heroai never touches
+    LOOT_PAUSE, the value written here persists until the next service
+    frame (~50 ms), making the pause reliable despite execution order.
+    USER_INTERRUPT_ACTIVE and LOOTING_ACTIVE from HeroAI are forwarded
+    so _Move() still respects those events even though it no longer reads
+    PAUSE_MOVEMENT.
+    """
+    from Py4GWCoreLib.py4gwcorelib_src.Lootconfig_src import LootConfig
+
+    def _tick(node: BehaviorTree.Node) -> BehaviorTree.NodeState:
+        try:
+            bb = node.blackboard
+            in_combat = bool(bb.get('COMBAT_ACTIVE', False))
+            heroai_pause = (
+                bool(bb.get('LOOTING_ACTIVE', False))
+                or bool(bb.get('USER_INTERRUPT_ACTIVE', False))
+            )
+            if in_combat:
+                bb['LOOT_PAUSE'] = heroai_pause
+            else:
+                loot = LootConfig().GetfilteredLootArray() if not heroai_pause else []
+                bb['LOOT_PAUSE'] = heroai_pause or len(loot) > 0
+        except Exception:
+            node.blackboard['LOOT_PAUSE'] = False
+        return BehaviorTree.NodeState.RUNNING
+
+    return BehaviorTree(
+        root=BehaviorTree.RepeaterForeverNode(
+            child=BehaviorTree.ActionNode(
+                name='LootPauseServiceTick',
+                action_fn=_tick,
+            ),
+            name='LootPauseService',
+        )
+    )
 
 
 def _get_sequence_builders():
@@ -865,6 +1012,8 @@ def main():
             start_from="PrepareOutpost",
             name="UnderworldRun",
         )
+        botting_tree.AddServiceTree('LootPauseService', _build_loot_pause_service)
+        botting_tree.AddPartyWipeRecoveryService(default_step_name="PrepareOutpost")
         botting_tree.UI.override_draw_config(_draw_settings_tab)
         # Apply persisted debug-logging flag to BTF helpers.
         BTF.SetDebugLogging(bool(IniManager().getBool(INI_KEY, "debug_logging", False)))
