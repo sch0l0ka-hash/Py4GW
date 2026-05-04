@@ -642,9 +642,9 @@ def _build_chamber_tree() -> BehaviorTree:
             name="Chamber",
             children=[
                 BT.WaitUntilOnExplorable(timeout_ms=60_000).root,
-                BT.Move([Vec2f(281,7229)], pause_on_combat=True, wait_party_behind=True).root,
+                BT.Move([Vec2f(281,7229)], pause_on_combat=True).root,
                 BT.MoveAndAutoDialogByModelID(LOST_SOUL_MODEL_ID).root,
-                BT.Move(CHAMBER_PATH, pause_on_combat=True, wait_party_behind=True).root,
+                BT.Move(CHAMBER_PATH, pause_on_combat=True).root,
                 # Accept "Clear the Chamber" Quest Reward
                 BT.MoveAndAutoDialogByModelID(REAPER_OF_THE_LABYRINTH_MODEL_ID).root,
                 # Take "Restoring Grenth's Monuments" quest from the same Reaper.
@@ -663,7 +663,7 @@ def _build_restore_mountains_tree() -> BehaviorTree:
         BehaviorTree.SequenceNode(
             name="RestoreMountains",
             children=[
-                BT.Move(RESTORE_MOUNTAINS_PATH, pause_on_combat=True, combat_range=400.0, wait_party_behind=True).root,
+                BT.Move(RESTORE_MOUNTAINS_PATH, pause_on_combat=True).root,
             ],
         )
     )
@@ -677,9 +677,9 @@ def _build_demon_assassin_tree() -> BehaviorTree:
         BehaviorTree.SequenceNode(
             name="DemonAssassin",
             children=[
-                BT.Move([Vec2f(-8250,-5237)], pause_on_combat=True, wait_party_behind=True).root,
+                BT.Move([Vec2f(-8250,-5237)], pause_on_combat=True).root,
                 BT.TargetAndDialogByModelID(REAPER_OF_THE_MOUNTAINS_MODEL_ID, 0x806801).root,
-                BT.Move(DEMON_ASSASSIN_PATH, pause_on_combat=True, wait_party_behind=True).root,
+                BT.Move(DEMON_ASSASSIN_PATH, pause_on_combat=True).root,
                 _wait_until_active_quest_completed(
                     name="WaitDemonAssassinComplete",
                 ).root,
@@ -701,7 +701,7 @@ def _build_restore_chaos_planes_tree() -> BehaviorTree:
                     "banished dream rider",
                     name="Blacklist Banished Dream Rider",
                 ).root,
-                BT.Move(RESTORE_CHAOS_PLANES_PATH, pause_on_combat=True, wait_party_behind=True).root,
+                BT.Move(RESTORE_CHAOS_PLANES_PATH, pause_on_combat=True).root,
                 _unblacklist_enemy_name(
                     "banished dream rider",
                     name="Unblacklist Banished Dream Rider",
@@ -714,7 +714,6 @@ def _build_restore_chaos_planes_tree() -> BehaviorTree:
                 BT.Move(
                     [CHAOS_PLANES_MINDBLADE_HOLD_POSITION_2],
                     pause_on_combat=True,
-                    wait_party_behind=True,
                 ).root,
                 _wait_until_no_mindblades(
                     name="WaitNoMindblades2",
@@ -782,7 +781,7 @@ def _build_four_horsemen_tree() -> BehaviorTree:
             name="FourHorsemen",
             children=[
                 # Phase 1: pre-position before talking to the Reaper.
-                BT.Move([FOUR_HORSEMEN_PRE_POSITION], pause_on_combat=True, wait_party_behind=True).root,
+                BT.Move([FOUR_HORSEMEN_PRE_POSITION], pause_on_combat=True).root,
                 # Spread hero flags around the pre-position so the team fans
                 # out while HeroAI / followers settle (mirrors legacy 10s wait).
                 _spread_party_flags(
@@ -791,7 +790,7 @@ def _build_four_horsemen_tree() -> BehaviorTree:
                 ).root,
                 #BT.Wait(10_000).root,
                 # Phase 2: take the Four Horsemen quest from the Chaos Planes Reaper.
-                BT.Move([FOUR_HORSEMEN_NPC_POSITION], pause_on_combat=True, wait_party_behind=True).root,
+                BT.Move([FOUR_HORSEMEN_NPC_POSITION], pause_on_combat=True).root,
                 BT.TargetAndDialogByModelID(
                     REAPER_OF_THE_CHAOS_PLANES_MODEL_ID, 0x806A01
                 ).root,
@@ -814,7 +813,7 @@ def _build_four_horsemen_tree() -> BehaviorTree:
                     FOUR_HORSEMEN_HOLD_FLAG_POINTS,
                     name="SpreadFourHorsemenHoldFlags",
                 ).root,
-                BT.Move([FOUR_HORSEMEN_HOLD_FLAG_POINTS[0]], pause_on_combat=True, wait_party_behind=True).root,
+                BT.Move([FOUR_HORSEMEN_HOLD_FLAG_POINTS[0]], pause_on_combat=True).root,
                 _wait_until_active_quest_completed(
                     name="WaitFourHorsemenComplete",
                 ).root,
@@ -822,7 +821,7 @@ def _build_four_horsemen_tree() -> BehaviorTree:
                 # reward dialog.
                 _clear_party_flags(name="ClearFourHorsemenFlags").root,
                 # Phase 5: take the quest reward from the Reaper of the Chaos Planes.
-                BT.Move([FOUR_HORSEMEN_NPC_POSITION], pause_on_combat=True, wait_party_behind=True).root,
+                BT.Move([FOUR_HORSEMEN_NPC_POSITION], pause_on_combat=True).root,
                 BT.TargetAndDialogByModelID(
                     REAPER_OF_THE_CHAOS_PLANES_MODEL_ID, 0x806A07
                 ).root,

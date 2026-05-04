@@ -161,9 +161,6 @@ class BTMovement:
         pause_flag_key: str = "PAUSE_MOVEMENT",
         log: bool = False,
         path_points_override: list[tuple[float, float]] | None = None,
-        combat_range: float | None = None,
-        wait_party_behind: bool = False,
-        wait_party_behind_range: float = 3500.0,
     ) -> BehaviorTree:
         """
         Build a tree that moves the player to target coordinates using autopathing and runtime recovery logic.
@@ -203,8 +200,6 @@ class BTMovement:
             "strafe_started_ms": None,
             "strafe_duration_ms": 500,
             "last_move_command_ms": None,
-            "party_behind_wait_start_ms": None,
-            "party_behind_pixelstack_last_ms": None,
         }
 
         def _reset_runtime() -> None:
@@ -242,8 +237,6 @@ class BTMovement:
             state["strafe_started_ms"] = None
             state["strafe_duration_ms"] = 500
             state["last_move_command_ms"] = None
-            state["party_behind_wait_start_ms"] = None
-            state["party_behind_pixelstack_last_ms"] = None
 
         def _reset_result() -> None:
             """
@@ -393,18 +386,12 @@ class BTMovement:
                 return "loot_message_active"
             if Checks.Player.IsDead():
                 return "player_dead"
-            if pause_on_combat:
-                if combat_range is not None:
-                    if Checks.Agents.InDanger(aggro_area=combat_range):
-                        return "combat"
-                elif bool(node.blackboard.get("COMBAT_ACTIVE", False)):
-                    return "combat"
+            if pause_on_combat and bool(node.blackboard.get("COMBAT_ACTIVE", False)):
+                return "combat"
             if bool(node.blackboard.get(pause_flag_key, False)):
                 return "external_pause"
-            if combat_range is None and Checks.Player.IsCasting():
+            if Checks.Player.IsCasting():
                 return "casting"
-            if wait_party_behind and Checks.Party.IsPartyMemberBehind(range_value=int(wait_party_behind_range)):
-                return "party_behind"
             return ""
 
         def _issue_move(target_x: float, target_y: float) -> None:
@@ -637,50 +624,11 @@ class BTMovement:
                 state["strafe_side"] = ""
                 state["strafe_phase"] = 0
                 _set_blackboard(node, "paused", pause_reason)
-                if pause_reason == "party_behind":
-                    if state["party_behind_wait_start_ms"] is None:
-                        state["party_behind_wait_start_ms"] = now
-                        state["party_behind_pixelstack_last_ms"] = None
-                    waited_ms = now - state["party_behind_wait_start_ms"]
-                    if waited_ms >= 10_000:
-                        last_ps = state["party_behind_pixelstack_last_ms"]
-                        if last_ps is None or (now - last_ps) >= 10_000:
-                            try:
-                                _px, _py = Player.GetXY()
-                                _sender = Player.GetAccountEmail()
-                                _cur_map = Map.GetMapID()
-                                for _acc in GLOBAL_CACHE.ShMem.GetAllAccountData():
-                                    if _acc.AccountEmail == _sender:
-                                        continue
-                                    if _acc.AgentData.Map.MapID != _cur_map:
-                                        continue
-                                    GLOBAL_CACHE.ShMem.SendMessage(_sender, _acc.AccountEmail, SharedCommandType.PixelStack, (_px, _py, 0, 0))
-                            except Exception:
-                                pass
-                            state["party_behind_pixelstack_last_ms"] = now
-                else:
-                    state["party_behind_wait_start_ms"] = None
-                    state["party_behind_pixelstack_last_ms"] = None
                 return BehaviorTree.NodeState.RUNNING
             elif state["pause_logged"]:
                 if log:
                     _log("Move", "Movement resumed.", message_type=Console.MessageType.Info, log=log)
-                _pixelstack_was_sent = state["party_behind_pixelstack_last_ms"] is not None
                 state["pause_logged"] = False
-                state["party_behind_wait_start_ms"] = None
-                state["party_behind_pixelstack_last_ms"] = None
-                if _pixelstack_was_sent:
-                    try:
-                        _sender = Player.GetAccountEmail()
-                        _cur_map = Map.GetMapID()
-                        for _acc in GLOBAL_CACHE.ShMem.GetAllAccountData():
-                            if _acc.AccountEmail == _sender:
-                                continue
-                            if _acc.AgentData.Map.MapID != _cur_map:
-                                continue
-                            GLOBAL_CACHE.ShMem.SendMessage(_sender, _acc.AccountEmail, SharedCommandType.EnableHeroAI, (1, 0, 0, 0))
-                    except Exception:
-                        pass
             if state["was_paused"]:
                 state["was_paused"] = False
                 state["resume_recovery_active"] = True
@@ -1152,9 +1100,6 @@ class BTMovement:
         pause_on_combat: bool = True,
         tolerance: float = DEFAULT_MOVE_TOLERANCE,
         log: bool = False,
-        combat_range: float | None = None,
-        wait_party_behind: bool = False,
-        wait_party_behind_range: float = 3500.0,
     ) -> BehaviorTree:
         """
         Build a tree that walks a path of one or more points.
@@ -1178,9 +1123,6 @@ class BTMovement:
                 tolerance=tolerance,
                 pause_on_combat=pause_on_combat,
                 log=log,
-                combat_range=combat_range,
-                wait_party_behind=wait_party_behind,
-                wait_party_behind_range=wait_party_behind_range,
             ),
         )
 

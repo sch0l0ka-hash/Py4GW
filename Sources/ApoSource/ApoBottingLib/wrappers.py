@@ -211,17 +211,11 @@ def Move(
     pos: PointOrPath,
     pause_on_combat: bool = True,
     tolerance: float = 150.0,
-    combat_range: float | None = None,
-    wait_party_behind: bool = False,
-    wait_party_behind_range: float = 3500.0,
 ) -> BehaviorTree:
     return RoutinesBT.Movement.MovePath(
         pos=pos,
         pause_on_combat=pause_on_combat,
         tolerance=tolerance,
-        combat_range=combat_range,
-        wait_party_behind=wait_party_behind,
-        wait_party_behind_range=wait_party_behind_range,
         log=False,
     )
 
