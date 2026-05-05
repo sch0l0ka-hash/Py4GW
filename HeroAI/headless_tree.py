@@ -34,14 +34,6 @@ class HeroAIHeadlessTree:
         index, message = GLOBAL_CACHE.ShMem.PreviewNextMessage(account_email)
         return bool(index != -1 and message and message.Command == SharedCommandType.PickUpLoot)
 
-    def _finish_active_pick_up_loot_message(self) -> bool:
-        account_email = Player.GetAccountEmail()
-        index, message = GLOBAL_CACHE.ShMem.PreviewNextMessage(account_email)
-        if index == -1 or message is None or message.Command != SharedCommandType.PickUpLoot:
-            return False
-        GLOBAL_CACHE.ShMem.MarkMessageAsFinished(account_email, index)
-        return True
-
     def _is_looting_routine_active(self) -> bool:
         options = self.cached_data.account_options
         if not options or not options.Looting:
@@ -61,35 +53,22 @@ class HeroAIHeadlessTree:
     def _handle_looting(self) -> BehaviorTree.NodeState:
         options = self.cached_data.account_options
         if not options or not options.Looting:
-            self._finish_active_pick_up_loot_message()
             self.cached_data.in_looting_routine = False
             return BehaviorTree.NodeState.FAILURE
 
         if self.cached_data.data.in_aggro:
-            self._finish_active_pick_up_loot_message()
             self.cached_data.in_looting_routine = False
             return BehaviorTree.NodeState.FAILURE
 
         if self._has_active_pick_up_loot_message():
             self.cached_data.in_looting_routine = True
             if not Routines.Checks.Map.MapValid() or not Map.IsExplorable():
-                self._finish_active_pick_up_loot_message()
                 self.cached_data.in_looting_routine = False
                 return BehaviorTree.NodeState.FAILURE
             if GLOBAL_CACHE.Inventory.GetFreeSlotCount() <= 1:
-                self._finish_active_pick_up_loot_message()
                 self.cached_data.in_looting_routine = False
                 return BehaviorTree.NodeState.FAILURE
             if self._loot_throttle_check.IsExpired():
-                # Only cancel the message if Messaging.py is not actively
-                # processing it (Running=True). Cancelling a Running message
-                # would kill the loot coroutine mid-flight and leave the item
-                # on the ground while BT.Move resumes walking.
-                account_email = Player.GetAccountEmail()
-                _, running_msg = GLOBAL_CACHE.ShMem.PreviewNextMessage(account_email)
-                if running_msg and bool(getattr(running_msg, 'Running', False)):
-                    return BehaviorTree.NodeState.RUNNING
-                self._finish_active_pick_up_loot_message()
                 self.cached_data.in_looting_routine = False
                 return BehaviorTree.NodeState.FAILURE
             return BehaviorTree.NodeState.RUNNING
@@ -181,10 +160,7 @@ class HeroAIHeadlessTree:
         return execute_follower_follow(self.cached_data, self._follow_state)
 
     def IsLootingActive(self) -> bool:
-        # Use the cached flag set by _handle_looting so this stays True for
-        # the full duration of the loot coroutine in Messaging.py, not just
-        # the first 250 ms throttle window.
-        return bool(self.cached_data.in_looting_routine)
+        return self._is_looting_routine_active()
 
     def IsLootingNodeRunning(self) -> bool:
         if self._looting_node is None:

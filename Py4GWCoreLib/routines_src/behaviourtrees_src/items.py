@@ -1054,6 +1054,34 @@ class BTItems:
         )
 
     @staticmethod
+    def RestockItemsFromList(
+        items: Sequence[tuple[int, int]],
+        allow_missing: bool = False,
+    ) -> BehaviorTree:
+        """
+        Build a tree that restocks multiple inventory models from storage up to their requested quantities.
+
+        Meta:
+          Expose: true
+          Audience: intermediate
+          Display: Restock Items From List
+          Purpose: Restock several models from storage in sequence using `(model_id, desired_quantity)` pairs.
+          UserDescription: Use this when a step needs several consumables or items restocked before leaving outpost.
+          Notes: Reuses the single-item restock routine for each list entry and preserves the same allow-missing behavior.
+        """
+        return BTComposite.Sequence(
+            *[
+                BTItems.RestockItems(
+                    model_id=int(model_id),
+                    desired_quantity=int(desired_quantity),
+                    allow_missing=allow_missing,
+                )
+                for model_id, desired_quantity in items
+            ],
+            name="RestockItemsFromList",
+        )
+
+    @staticmethod
     def DepositModelToStorage(model_id: int, aftercast_ms: int = 350) -> BehaviorTree:
         """
         Build a tree that deposits all inventory items of a specific model into storage.
@@ -1210,7 +1238,7 @@ class BTItems:
     def BuyMaterial(
         model_id: int,
         log: bool = False,
-        aftercast_ms: int = 125,
+        aftercast_ms: int = 250,
     ) -> BehaviorTree:
         return BTItems.BuyMaterials(
             model_id=model_id,
@@ -1224,7 +1252,7 @@ class BTItems:
         model_id: int,
         batches: int = 1,
         log: bool = False,
-        aftercast_ms: int = 125,
+        aftercast_ms: int = 250,
     ) -> BehaviorTree:
         """
         Build a tree that buys one or more material-trader batches of the requested material.
@@ -1361,7 +1389,7 @@ class BTItems:
         model_id: int,
         quantity: int = 1,
         log: bool = False,
-        aftercast_ms: int = 125,
+        aftercast_ms: int = 250,
     ) -> BehaviorTree:
         """
         Build a tree that buys one or more copies of a merchant item by model id.
