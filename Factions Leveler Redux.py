@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import math
 from typing import Callable
+
+
 
 from Py4GWCoreLib.Agent import Agent
 from Py4GWCoreLib.BottingTree import BottingTree
@@ -10,8 +13,14 @@ from Py4GWCoreLib.py4gwcorelib_src.BehaviorTree import BehaviorTree
 from Py4GWCoreLib.enums_src.Model_enums import ModelID
 from Py4GWCoreLib.enums_src.Item_enums import Bags
 from Py4GWCoreLib.Map import Map
+from Py4GWCoreLib.routines_src.Agents import Agents as RoutinesAgents
+from Py4GWCoreLib.routines_src.Checks import Checks
+
+
 from Sources.ApoSource.ApoBottingLib import wrappers as BT
 from Py4GWCoreLib.enums_src.GameData_enums import Range
+from Py4GWCoreLib.native_src.internals.types import PointOrPath
+from Py4GWCoreLib.native_src.internals.types import PointPath
 
 
 MODULE_NAME = "Botting Tree Template"
@@ -63,17 +72,6 @@ LEVELING_SKILLBAR_MAP: dict[str, list[tuple[int | None, str]]] = {
         (20, "OAWBIskDcdG0DaAKUECA"),
         (None, "OwVCErwSOw1ZQPoBoQRIA"),
     ],
-}
-
-EARLY_ARMOR_BUY_BATCHES: dict[str, list[tuple[int, int]]] = {
-    "Warrior": [(ModelID.Bolt_Of_Cloth.value, 6)],
-    "Ranger": [(ModelID.Tanned_Hide_Square.value, 6)],
-    "Monk": [(ModelID.Bolt_Of_Cloth.value, 6), (ModelID.Pile_Of_Glittering_Dust.value, 1)],
-    "Assassin": [(ModelID.Bolt_Of_Cloth.value, 6)],
-    "Mesmer": [(ModelID.Bolt_Of_Cloth.value, 6)],
-    "Necromancer": [(ModelID.Tanned_Hide_Square.value, 6), (ModelID.Pile_Of_Glittering_Dust.value, 1)],
-    "Ritualist": [(ModelID.Bolt_Of_Cloth.value, 6)],
-    "Elementalist": [(ModelID.Bolt_Of_Cloth.value, 6), (ModelID.Pile_Of_Glittering_Dust.value, 1)],
 }
 
 MONASTERY_ARMOR_DATA: dict[str, list[tuple[int, list[int], list[int]]]] = {
@@ -197,7 +195,18 @@ def _get_henchmen_for_current_map() -> list[int]:
 
 def GetEarlyArmorMaterialsByProfession() -> list[tuple[int, int]]:
     primary, _ = Agent.GetProfessionNames(Player.GetAgentID())
-    return list(EARLY_ARMOR_BUY_BATCHES.get(primary, EARLY_ARMOR_BUY_BATCHES["Warrior"]))
+    armor_data = MONASTERY_ARMOR_DATA.get(primary, MONASTERY_ARMOR_DATA["Warrior"])
+    totals_by_model: dict[int, int] = {}
+
+    for _, material_models, material_quantities in armor_data:
+        for model_id, quantity in zip(material_models, material_quantities):
+            totals_by_model[model_id] = totals_by_model.get(model_id, 0) + int(quantity)
+
+    return [
+        (model_id, max(1, math.ceil(total_quantity / 10)))
+        for model_id, total_quantity in totals_by_model.items()
+        if total_quantity > 0
+    ]
 
 
 def GetMonasteryArmorByProfession() -> list[tuple[int, list[int], list[int]]]:
@@ -213,6 +222,15 @@ def GetStarterArmorAndUselessItemsByProfession() -> list[int]:
 
 def PrepareForBattle() -> BehaviorTree:
     bot = ensure_botting_tree()
+    restock_candy_apple_qty = 0# 10
+    restock_war_supplies_qty = 0# 10
+    restock_honeycomb_qty = 0# 20
+    
+    restock_list = [
+        (ModelID.Candy_Apple.value, restock_candy_apple_qty), 
+        (ModelID.War_Supplies.value, restock_war_supplies_qty), 
+        (ModelID.Honeycomb.value, restock_honeycomb_qty),
+    ]
     return BehaviorTree(
         BehaviorTree.SequenceNode(
             name="Prepare For Battle",
@@ -221,17 +239,8 @@ def PrepareForBattle() -> BehaviorTree:
                 BT.LoadSkillbarFromMap(LEVELING_SKILLBAR_MAP),
                 BT.LeaveParty(),
                 BT.AddHenchmanList(_get_henchmen_for_current_map()),
-                BT.RestockItems(ModelID.Candy_Apple.value, 10, allow_missing=True),
-                BT.RestockItems(ModelID.War_Supplies.value, 10, allow_missing=True),
-                BT.RestockItems(ModelID.Honeycomb.value, 20, allow_missing=True),
+                BT.RestockItemsFromList(restock_list,allow_missing=True,),
             ],
-        )
-    )
-
-def InitializeBot() -> BehaviorTree:
-    return BehaviorTree(
-        BehaviorTree.SucceederNode(
-            name="Initialize Bot",
         )
     )
 
@@ -254,18 +263,15 @@ def Forming_A_Party() -> BehaviorTree:
             children=[
                 BT.Travel(target_map_name="Shing Jea Monastery"),
                 PrepareForBattle(),
-                BT.MoveAndDialog((-14063.00, 10044.00), dialog_id=0x81B801),
-                BT.WaitForActiveQuest(quest_id=440),
+                BT.HandleQuest(440, (-14063.00, 10044.00), 0x81B801, mode="accept"),
                 BT.MoveAndExitMap((-14961, 11453), target_map_name="Sunqua Vale"),
-                BT.MoveAndDialog((19673.00, -6982.00), dialog_id=0x81B807),
-                BT.WaitForQuestCleared(quest_id=440),
+                BT.HandleQuest(440, (19673.00, -6982.00), 0x81B807, mode="complete"),
             ],
         )
     )
     
 
 def Unlock_Secondary_Profession() -> BehaviorTree:
-    bot = ensure_botting_tree()
     primary, _ = Agent.GetProfessionNames(Player.GetAgentID())
     unlock_dialog = 0x813D08 if primary == "Mesmer" else 0x813D0E
     return BehaviorTree(
@@ -273,12 +279,11 @@ def Unlock_Secondary_Profession() -> BehaviorTree:
             name="Unlock Secondary Profession",
             children=[
                 BT.Travel(target_map_name="Shing Jea Monastery"),
-                bot.Config.Pacifist(),
+                ensure_botting_tree().Config.Pacifist(),
                 BT.MoveAndExitMap((-3480, 9460), target_map_name="Linnok Courtyard",),
-                BT.Move((-159, 9174), pause_on_combat=False),
-                bot.Routines.HandleQuest(317, (-92, 9217), unlock_dialog),
-                bot.Routines.HandleQuest(317, (-92, 9217), 0x813D07, mode="complete"),
-                bot.Routines.HandleQuest(318, (-92, 9217), 0x813E01),
+                BT.HandleQuest(317, [(-159, 9174), (-92, 9217)], unlock_dialog),
+                BT.HandleQuest(317, (-92, 9217), 0x813D07, mode="complete"),
+                BT.HandleQuest(318, (-92, 9217), 0x813E01),
                 BT.MoveAndExitMap((-3762, 9471),target_map_name="Shing Jea Monastery",),
             ],
         )
@@ -311,11 +316,9 @@ def Craft_Weapon() -> BehaviorTree:
             children=[
                 BT.Travel(target_map_name="Shing Jea Monastery"),
                 BT.EqualizeGold(target_gold=5000),
-                BT.MoveAndInteract(path_to_materials_merchant),
-                BT.BuyMaterials(ModelID.Wood_Plank.value, batches=1),
+                BT.MoveAndBuyMaterials(path_to_materials_merchant, ModelID.Wood_Plank.value, batches=1),
                 BT.BuyMaterialsFromList(GetEarlyArmorMaterialsByProfession()),
-                BT.MoveAndInteract(path_to_weapon_crafter),
-                BT.CraftItem(output_model_id=longbow_model_id,cost=100,trade_model_ids=[ModelID.Wood_Plank.value],quantity_list=[5],),
+                BT.MoveAndCraftItem(pos=path_to_weapon_crafter, output_model_id=longbow_model_id,cost=100,trade_model_ids=[ModelID.Wood_Plank.value],quantity_list=[5],),
                 BT.EquipItemByModelID(longbow_model_id),
             ],
         )
@@ -355,8 +358,7 @@ def Extend_Inventory_Space() -> BehaviorTree:
             name="Extend Inventory Space",
             children=[
                 BT.Travel(target_map_name="Shing Jea Monastery"),
-                BT.MoveAndInteract(merchant),
-                BT.BuyMerchantItem(ModelID.Belt_Pouch.value, quantity=1),
+                BT.MoveAndBuyMerchantItem(merchant, ModelID.Belt_Pouch.value, quantity=1),
                 BT.EquipInventoryBag(ModelID.Belt_Pouch.value, Bags.BeltPouch),
                 BT.BuyMerchantItem(ModelID.Bag.value, quantity=1),
                 BT.EquipInventoryBag(ModelID.Bag.value, Bags.Bag1),
@@ -367,33 +369,112 @@ def Extend_Inventory_Space() -> BehaviorTree:
     )
     
 def To_Minister_Chos_Estate() -> BehaviorTree:
-    bot = ensure_botting_tree()
     exit_to_sunqua_coords = (-14961, 11453)
     intro_quest_path = [
+        (16182.62, -7841.86),
         (6611.58, 15847.51),
         (6661.90, 16081.70),
     ]
+    minister_cho_state_map_id = 214
+    
     return BehaviorTree(
         BehaviorTree.SequenceNode(
             name="To Minister Cho's Estate",
             children=[
-                _trace_step("To Minister Cho's Estate: Travel To Shing Jea Monastery", BT.Travel(target_map_name="Shing Jea Monastery")),
-                _trace_step("To Minister Cho's Estate: Configure Pacifist", bot.Config.Pacifist()),
-                _trace_step("To Minister Cho's Estate: Exit To Sunqua Vale", BT.MoveAndExitMap(exit_to_sunqua_coords, target_map_name="Sunqua Vale")),
-                _trace_step("To Minister Cho's Estate: Move To Intro Path 1", BT.Move((16182.62, -7841.86), pause_on_combat=False)),
-                _trace_step("To Minister Cho's Estate: Move To Intro Path 2", BT.Move((6611.58, 15847.51), pause_on_combat=False)),
-                _trace_step(
-                    "To Minister Cho's Estate: Step 1 - A Formal Introduction",
-                    bot.Routines.HandleQuest(
-                        318,
-                        intro_quest_path,
-                        0x80000B,
-                        mode="skip",
-                        success_map_id=214,
-                    ),
+                BT.Travel(target_map_name="Shing Jea Monastery"),
+                ensure_botting_tree().Config.Pacifist(),
+                BT.MoveAndExitMap(exit_to_sunqua_coords, target_map_name="Sunqua Vale"),
+                BT.HandleQuest(318, intro_quest_path, 0x80000B, mode="skip", success_map_id=minister_cho_state_map_id),
+                BT.WaitForMapToChange(map_id=minister_cho_state_map_id),
+                BT.HandleQuest(318, (7884, -10029), 0x813E07, mode="complete"),
+            ],
+        )
+    )
+
+def Minister_Chos_Estate_Mission() -> BehaviorTree:
+    bot = ensure_botting_tree()
+    minister_cho_state_map_id = 214
+    ran_musu_gardens_map_id = 251
+    return BehaviorTree(
+        BehaviorTree.SequenceNode(
+            name="Minister Cho's Estate Mission",
+            children=[
+                BT.Travel(target_map_id=minister_cho_state_map_id),
+                PrepareForBattle(),
+                BT.EnterChallenge(delay_ms=4500, target_map_id=minister_cho_state_map_id),
+                BT.WaitForMapToChange(map_id=minister_cho_state_map_id),
+                BT.Move([(6220.76, -7360.73),(5523.95, -7746.41)]),
+                BT.Wait(13000, emote=True, announce_delay=True),
+                BT.Move((591.21, -9071.10)),
+                BT.Wait(26500, emote=True, announce_delay=True),
+                BT.Move([(4889, -5043), (4222.58, -3475.46)]),
+                BT.Wait(45000, emote=True, announce_delay=True),
+                BT.Move([(6216, -1108), (2617, 642), (1706.90, 1711.44)]),
+                BT.Wait(25000, emote=True, announce_delay=True),
+                BT.Move([(333.32, 1124.44), (-3337.14, -4741.27)]),
+                BT.Wait(35000, emote=True, announce_delay=True),
+                BT.Move([(-4661.99, -6285.81), (-7454, -7384), (-9138, -4191), (-7109, -25), (-7443, 2243)]),
+                BT.Wait(5000,  announce_delay=True),
+                BT.Move((-16924, 2445)),
+                BT.MoveAndInteract((-17031, 2448), target_distance=Range.Nearby.value),
+                BT.WaitForMapToChange(map_id=ran_musu_gardens_map_id),
+            ],
+        )
+    )
+
+def Attribute_Points_Quest_1() -> BehaviorTree:
+    ran_musu_gardens_map_id = 251
+    lost_treasure_quest_id = 346
+    guard_model_id = 3093
+
+    def _escort_complete() -> bool:
+        guard_agent_id = int(RoutinesAgents.GetAgentIDByModelOrEncStr(guard_model_id) or 0)
+        return (
+            guard_agent_id != 0
+            and Agent.HasQuest(guard_agent_id)
+            and not Checks.Agents.InDanger(aggro_area=Range.Spirit)
+        )
+
+    return BehaviorTree(
+        BehaviorTree.SequenceNode(
+            name="Attribute Points Quest 1",
+            children=[
+                BT.Travel(target_map_id=ran_musu_gardens_map_id),
+                BT.HandleQuest(lost_treasure_quest_id, [(15775.29, 18832.91),(14363.00, 19499.00)], 0x815A01, mode=BT.Questmode.Accept),
+                PrepareForBattle(),
+                BT.Move((14458.48, 17918.11)),
+                BT.MoveDirect((15819.00, 18835.17)),
+                BT.MoveAndExitMap((17005.00, 19787.00), target_map_id=245),
+                BT.HandleQuest(
+                    lost_treasure_quest_id,
+                    (-17979.38, -493.08),
+                    0x815A04,
+                    mode=BT.Questmode.Step,
+                    use_npc_model_or_enc_str=guard_model_id,
                 ),
-                _trace_step("To Minister Cho's Estate: Wait For Minister Cho's Estate", BT.WaitForMapToChange(map_id=214)),
-                _trace_step("To Minister Cho's Estate: Complete A Formal Introduction", bot.Routines.HandleQuest(318, (7884, -10029), 0x813E07, mode="complete")),
+                BT.Wait(duration_ms=13000, emote=True, announce_delay=True),
+                BT.FollowModel(
+                    guard_model_id,
+                    follow_range=Range.Area.value,
+                    exit_condition=_escort_complete,
+                    exit_by_area=((13796.71, -6514.31), Range.Spellcast.value),
+                ),
+                #touch waypoint to trigger movement
+                BT.Move((13796.71, -6514.31)),
+                BT.FollowModel(
+                    guard_model_id,
+                    follow_range=Range.Area.value,
+                    exit_condition=_escort_complete,
+                ),
+                BT.HandleQuest(
+                    lost_treasure_quest_id,
+                    None,
+                    0x815A07,
+                    mode=BT.Questmode.Complete,
+                    use_npc_model_or_enc_str=guard_model_id,
+                    require_quest_marker=True,
+                ),
+                BT.Travel(target_map_id=ran_musu_gardens_map_id),
             ],
         )
     )
@@ -401,7 +482,6 @@ def To_Minister_Chos_Estate() -> BehaviorTree:
 #main
 def get_execution_steps() -> list[tuple[str, Callable[[], BehaviorTree]]]:
     return [
-        ("Initialize Bot", InitializeBot),
         ("Exit Monastery Overlook", Exit_Monastery_Overlook),
         ("Forming A Party", Forming_A_Party),
         ("Unlock Secondary Profession", Unlock_Secondary_Profession),
@@ -410,6 +490,8 @@ def get_execution_steps() -> list[tuple[str, Callable[[], BehaviorTree]]]:
         ("Craft Monastery Armor", Craft_Monastery_Armor),
         ("Extend Inventory Space", Extend_Inventory_Space),
         ("To Minister Cho's Estate", To_Minister_Chos_Estate),
+        ("Minister Cho's Estate Mission", Minister_Chos_Estate_Mission),
+        ("Attribute Points Quest 1", Attribute_Points_Quest_1),
     ]
 
 def ensure_botting_tree() -> BottingTree:
