@@ -20,11 +20,14 @@ from Widgets.Automation.Bots.Missions.Core import BottingTreeFunctions as BTF
 from Sources.ApoSource.ApoBottingLib import wrappers as BT
 
 import os
+import time
 import Py4GW
 import PyImGui
 from Py4GWCoreLib import name_to_map_id
 from Py4GWCoreLib import AgentArray, Agent, Player
 from Py4GWCoreLib import GLOBAL_CACHE
+from Py4GWCoreLib import Map
+from Py4GWCoreLib import Range
 from Py4GWCoreLib.Quest import Quest
 from Py4GWCoreLib.native_src.internals.types import Vec2f
 
@@ -77,8 +80,7 @@ REAPER_OF_THE_LABYRINTH_MODEL_ID = 2399
 REAPER_OF_THE_MOUNTAINS_MODEL_ID = 2399
 REAPER_OF_THE_CHAOS_PLANES_MODEL_ID = 2399
 
-# Mindblade Spectre model id (Chaos Planes spawn that floods the area
-# until pulled & cleared).
+# Mindblade Spectre model id — same constant used in the legacy Wait_for_Spawns.
 MINDBLADE_MODEL_ID = 2380
 
 # Chamber clearing path: leader walks this loop after taking the quest to
@@ -475,23 +477,91 @@ def _spread_party_flags(
 
 
 def _wait_until_no_mindblades(
+    hold_position: Vec2f,
     *,
     name: str = "WaitUntilNoMindblades",
     timeout_ms: int = 20_000,
-    hold_position: Vec2f | None = None,
-    waves: int = 4,
-    delay_between_waves_ms: int = 1000,
 ) -> BehaviorTree:
-    """Wait until no alive Mindblade Spectre is left, repeated ``waves``
-    times so freshly spawned Mindblades after a brief lull are still
-    picked up. Each wave times out after ``timeout_ms``."""
-    return _wait_until_no_alive_model(
-        MINDBLADE_MODEL_ID,
-        name=name,
-        timeout_ms=timeout_ms,
-        hold_position=hold_position,
-        waves=waves,
-        delay_between_waves_ms=delay_between_waves_ms,
+    """1:1 BT port of Wait_for_Spawns from underworld.py.
+
+    4 waves, each: poll until no alive Mindblade Spectre (model 2380) is in the
+    area, or 20 s timeout — whichever comes first (timeout = skip and continue).
+    While enemies are present the leader is nudged back to ``hold_position``
+    each tick.  Between waves: 1 s pause then a move back to ``hold_position``,
+    matching the legacy bot_instance.Wait.ForTime(1000) + Move.XY pattern.
+    """
+    timeout_s = timeout_ms / 1000.0
+
+    def _make_wave_node(wave_label: str) -> BehaviorTree.Node:
+        state: dict = {'deadline': None}
+
+        def _tick(node: BehaviorTree.Node) -> BehaviorTree.NodeState:
+            enemies = [
+                e for e in AgentArray.GetEnemyArray()
+                if Agent.IsAlive(e) and Agent.GetModelID(e) == MINDBLADE_MODEL_ID
+            ]
+            if not enemies:
+                print(f"No Mindblades found - Continuing... ({wave_label})")
+                state['deadline'] = None
+                return BehaviorTree.NodeState.SUCCESS
+
+            now = time.monotonic()
+            if state['deadline'] is None:
+                state['deadline'] = now + timeout_s
+
+            if now >= state['deadline']:
+                print(f"Mindblades timeout after {timeout_s:.0f}s - skipping ({wave_label})")
+                state['deadline'] = None
+                return BehaviorTree.NodeState.SUCCESS  # timeout → skip, continue
+
+            print(f"Mindblades ... Waiting. ({wave_label})")
+            # Nudge leader back to hold position (mirrors Move.XY "Go Back").
+            Player.Move(hold_position.x, hold_position.y)
+            return BehaviorTree.NodeState.RUNNING
+
+        return BehaviorTree.ActionNode(name=f'{name}::Wave{wave_label}', action_fn=_tick)
+
+    def _make_delay_node(label: str) -> BehaviorTree.Node:
+        """1 s pause — mirrors bot_instance.Wait.ForTime(1000)."""
+        return BehaviorTree.SelectorNode(
+            name=f'{name}::Delay{label}',
+            children=[
+                BehaviorTree.WaitNode(
+                    check_fn=lambda: BehaviorTree.NodeState.RUNNING,
+                    timeout_ms=1000,
+                    name=f'{name}::DelayWait{label}',
+                ),
+                BehaviorTree.ActionNode(
+                    name=f'{name}::DelayDone{label}',
+                    action_fn=lambda node: BehaviorTree.NodeState.SUCCESS,
+                ),
+            ],
+        )
+
+    def _make_move_node(label: str) -> BehaviorTree.Node:
+        """Move back to hold_position — mirrors Move.XY(x, y, label)."""
+        def _tick(node: BehaviorTree.Node) -> BehaviorTree.NodeState:
+            Player.Move(hold_position.x, hold_position.y)
+            return BehaviorTree.NodeState.SUCCESS
+        return BehaviorTree.ActionNode(name=f'{name}::MoveBack{label}', action_fn=_tick)
+
+    # Sequence: wave1 → delay → move → wave2 → delay → move → wave3 → delay → move → wave4
+    return BehaviorTree(
+        root=BehaviorTree.SequenceNode(
+            name=name,
+            children=[
+                _make_wave_node('1'),
+                _make_delay_node('1'),
+                _make_move_node('1'),
+                _make_wave_node('2'),
+                _make_delay_node('2'),
+                _make_move_node('2'),
+                _make_wave_node('3'),
+                _make_delay_node('3'),
+                _make_move_node('3'),
+                _make_wave_node('4'),
+            ],
+        )
     )
 
 
@@ -706,19 +776,21 @@ def _build_restore_chaos_planes_tree() -> BehaviorTree:
                     "banished dream rider",
                     name="Unblacklist Banished Dream Rider",
                 ).root,
+                BT.Wait(5000).root,  # brief pause to let any newly spawned Mindblades settle before the first wave
                 _wait_until_no_mindblades(
+                    CHAOS_PLANES_MINDBLADE_HOLD_POSITION,
                     name="WaitNoMindblades",
                     timeout_ms=20_000,
-                    hold_position=CHAOS_PLANES_MINDBLADE_HOLD_POSITION,
                 ).root,
                 BT.Move(
                     [CHAOS_PLANES_MINDBLADE_HOLD_POSITION_2],
                     pause_on_combat=True,
                 ).root,
+                 BT.Wait(5000).root,  # brief pause to let any newly spawned Mindblades settle before the first wave
                 _wait_until_no_mindblades(
+                    CHAOS_PLANES_MINDBLADE_HOLD_POSITION_2,
                     name="WaitNoMindblades2",
                     timeout_ms=20_000,
-                    hold_position=CHAOS_PLANES_MINDBLADE_HOLD_POSITION_2,
                 ).root,
             ],
         )
@@ -881,6 +953,84 @@ def _build_loot_pause_service() -> BehaviorTree:
         )
     )
 
+def _build_wipe_recovery_service(
+    restart_step: str,
+    return_interval_ms: float = 1000.0,
+) -> BehaviorTree:
+    """Party-wipe recovery service that always restarts from ``restart_step``
+    regardless of which step was active when the wipe occurred.
+
+    Mirrors the logic of BottingTree.PartyWipeRecoveryServiceTree but with
+    a fixed restart target instead of using current_step_name.
+    """
+    from Py4GWCoreLib import GLOBAL_CACHE, Map, Routines
+    from Py4GWCoreLib.py4gwcorelib_src.ActionQueue import ActionQueueManager
+
+    state: dict = {'active': False, 'last_return_ms': 0.0}
+
+    def _reset(node: BehaviorTree.Node) -> None:
+        state['active'] = False
+        state['last_return_ms'] = 0.0
+        node.blackboard['party_wipe_recovery_active'] = False
+
+    def _tick(node: BehaviorTree.Node) -> BehaviorTree.NodeState:
+        now = time.monotonic() * 1000.0
+        is_wiped = bool(
+            Routines.Checks.Party.IsPartyWiped()
+            or GLOBAL_CACHE.Party.IsPartyDefeated()
+        )
+
+        if not state['active']:
+            if not is_wiped:
+                node.blackboard['party_wipe_recovery_active'] = False
+                return BehaviorTree.NodeState.RUNNING
+            state['active'] = True
+            state['last_return_ms'] = 0.0
+            node.blackboard['party_wipe_recovery_active'] = True
+            node.blackboard['party_wipe_recovery_step_name'] = restart_step
+            ActionQueueManager().ResetAllQueues()
+            return BehaviorTree.NodeState.RUNNING
+
+        node.blackboard['party_wipe_recovery_active'] = True
+        node.blackboard['party_wipe_recovery_step_name'] = restart_step
+
+        if Map.IsMapReady() and Map.IsOutpost() and GLOBAL_CACHE.Party.IsPartyLoaded():
+            node.blackboard['restart_step_name_request'] = restart_step
+            _reset(node)
+            return BehaviorTree.NodeState.SUCCESS
+
+        if now - state['last_return_ms'] >= return_interval_ms:
+            GLOBAL_CACHE.Party.ReturnToOutpost()
+            state['last_return_ms'] = now
+
+        return BehaviorTree.NodeState.RUNNING
+
+    return BehaviorTree(
+        root=BehaviorTree.RepeaterForeverNode(
+            child=BehaviorTree.ActionNode(
+                name='WipeRecoveryServiceTick',
+                action_fn=_tick,
+            ),
+            name='WipeRecoveryService',
+        )
+    )
+
+
+# Underworld enemies ordered from highest to lowest call priority.
+# Add or reorder entries to tune targeting behaviour.
+
+UW_TARGET_PRIORITY: list[str] = [
+    "Keeper of Souls",
+    "Skeleton of Dhuum",
+    "Terrorweb Dryder",
+    "Dead Collector",
+    "Dead Thresher",
+    "Mindblade Spectre ",
+    "Banished Dream Rider",
+    "Wailing Lord",
+    "Obsidian Behemoth",
+]
+
 
 def _get_sequence_builders():
     """Ordered list of (step_name, builder) tuples that make up one full UW run."""
@@ -991,6 +1141,101 @@ def _draw_settings_tab() -> None:
 
 
 # ╔══════════════════════════════════════════════════════════════════
+# ║                       TREE DEBUG VIEW
+# ╚══════════════════════════════════════════════════════════════════
+
+def _render_bt_node(node: object, depth: int, max_depth: int = 5) -> None:
+    """Render one BehaviorTree node and, if it is RUNNING, its children."""
+    from Py4GWCoreLib.py4gwcorelib_src.BehaviorTree import BehaviorTree as _BT
+
+    if depth > max_depth:
+        return
+
+    state = getattr(node, 'last_state', None)
+    name = getattr(node, 'name', '?')
+    NodeState = _BT.NodeState
+
+    if state == NodeState.RUNNING:
+        color = (255, 220, 0, 255)
+        symbol = '>'
+    elif state == NodeState.SUCCESS:
+        color = (80, 200, 80, 255)
+        symbol = 'v'
+    elif state == NodeState.FAILURE:
+        color = (255, 80, 80, 255)
+        symbol = '!'
+    else:
+        color = (130, 130, 130, 255)
+        symbol = '-'
+
+    PyImGui.text_colored(f'{"  " * depth}{symbol} {name}', color)
+
+    if state == NodeState.RUNNING:
+        for child in (getattr(node, 'children', None) or []):
+            _render_bt_node(child, depth + 1, max_depth)
+
+
+def _draw_subtree_tab() -> None:
+    """Extra 'Tree' tab: colour-coded live view of the planner BehaviorTree."""
+    from Py4GWCoreLib.py4gwcorelib_src.BehaviorTree import BehaviorTree as _BT
+
+    if botting_tree is None:
+        PyImGui.text('Bot not started.')
+        return
+    planner_tree = getattr(botting_tree, 'planner_tree', None)
+    if planner_tree is None or getattr(planner_tree, 'root', None) is None:
+        PyImGui.text('No active planner tree.')
+        return
+
+    NodeState = _BT.NodeState
+
+    if not PyImGui.begin_child('UWv2SubTree', (440, 400), True, PyImGui.WindowFlags.HorizontalScrollbar):
+        PyImGui.end_child()
+        return
+
+    try:
+        for step_wrapper in (getattr(planner_tree.root, 'children', None) or []):
+            step_name = step_wrapper.name
+            if step_name.startswith('Step: '):
+                step_name = step_name[6:]
+
+            state = step_wrapper.last_state
+            if state == NodeState.RUNNING:
+                color = (255, 220, 0, 255)
+                symbol = '>'
+            elif state == NodeState.SUCCESS:
+                color = (80, 200, 80, 255)
+                symbol = 'v'
+            elif state == NodeState.FAILURE:
+                color = (255, 80, 80, 255)
+                symbol = '!'
+            else:
+                color = (130, 130, 130, 255)
+                symbol = '-'
+
+            PyImGui.text_colored(f'{symbol} {step_name}', color)
+
+            if state != NodeState.RUNNING:
+                continue
+
+            # Expand the running step: skip MarkCurrentStep, unwrap SubtreeNode.
+            for inner in (getattr(step_wrapper, 'children', None) or []):
+                if getattr(inner, 'name', '').startswith('MarkCurrentStep('):
+                    continue
+                loaded_subtree = getattr(inner, '_subtree', None)
+                if loaded_subtree is not None:
+                    sub_root = getattr(loaded_subtree, 'root', None)
+                    if sub_root is not None:
+                        _render_bt_node(sub_root, depth=1, max_depth=5)
+                else:
+                    _render_bt_node(inner, depth=1, max_depth=5)
+    except Exception:
+        pass
+
+    PyImGui.end_child()
+
+
+# ╔══════════════════════════════════════════════════════════════════
 # ║                       MAIN ENTRYPOINT
 # ╚══════════════════════════════════════════════════════════════════
 
@@ -1006,13 +1251,30 @@ def main():
             IniManager().load_once(INI_KEY)
 
         botting_tree = BottingTree(BOT_NAME, isolation_enabled=False)
+        # Suppress the status bool rows (Started/Paused/etc.) from the Main tab.
+        botting_tree.UI._colored_bool = lambda label, value: None
         botting_tree.SetNamedPlannerSteps(
             _get_sequence_builders(),
             start_from="PrepareOutpost",
             name="UnderworldRun",
         )
         botting_tree.AddServiceTree('LootPauseService', _build_loot_pause_service)
-        botting_tree.AddPartyWipeRecoveryService(default_step_name="PrepareOutpost")
+        botting_tree.AddServiceTree(
+            'PriorityTargetService',
+            lambda: BTF.BuildPriorityTargetService(UW_TARGET_PRIORITY, Range.Earshot.value + 100.0),
+        )
+        botting_tree.AddServiceTree(
+            'WipeRecoveryService',
+            lambda: _build_wipe_recovery_service(restart_step='PrepareOutpost'),
+        )
+        botting_tree.AddServiceTree(
+            'PconUpkeepService',
+            lambda: BTF.BuildPconUpkeepService(mode='all'),
+        )
+        botting_tree.AddServiceTree(
+            'AllyWaitService',
+            lambda: BTF.BuildAllyWaitService(max_distance=2000.0),
+        )
         botting_tree.UI.override_draw_config(_draw_settings_tab)
         # Apply persisted debug-logging flag to BTF helpers.
         BTF.SetDebugLogging(bool(IniManager().getBool(INI_KEY, "debug_logging", False)))
@@ -1024,6 +1286,7 @@ def main():
             main_child_dimensions=(450, 450),
             icon_path=MODULE_ICON,
             iconwidth=128,
+            extra_tabs=[('Tree', _draw_subtree_tab)],
         )
 
 

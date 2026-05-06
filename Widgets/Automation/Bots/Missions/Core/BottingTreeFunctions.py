@@ -1252,3 +1252,383 @@ def UsePassageScrollOnRandomAccount(
 
     return BehaviorTree(root)
 
+
+# ╔══════════════════════════════════════════════════════════════════
+# ║                    PRIORITY TARGET CALLING
+# ╚══════════════════════════════════════════════════════════════════
+
+def CallPriorityTarget(
+    priority_names: list[str],
+    range_distance: float,
+    name: str = 'CallPriorityTarget',
+    min_call_interval_ms: float = 2000.0,
+) -> BehaviorTree:
+    """Call the highest-priority enemy in range as the party target.
+
+    A call is only issued when:
+    - There is no current target, OR
+    - A higher-priority enemy than the current target is in range.
+    AND at least *min_call_interval_ms* have elapsed since the last call.
+
+    Returns SUCCESS when a call was issued, FAILURE when no matching enemy
+    is in range or the cooldown is still active.
+
+    Args:
+        priority_names: Ordered list of enemy display names (case-insensitive).
+            First entry = highest priority.
+        range_distance: Search radius in game units (e.g. Range.Earshot.value).
+        name: Node name shown in the BT debug UI.
+        min_call_interval_ms: Minimum milliseconds between two consecutive calls.
+    """
+    import time as _time
+    from Py4GWCoreLib import Agent, AgentArray, Range, Routines
+    from Py4GWCoreLib import ActionQueueManager, Key, Keystroke
+    from Py4GWCoreLib import Utils
+
+    # Build a lowercase lookup: name -> priority index (lower = higher priority)
+    priority_map: dict[str, int] = {
+        n.strip().lower(): idx for idx, n in enumerate(priority_names)
+    }
+
+    state: dict = {'last_call_ms': 0.0}
+
+    def _tick(node: BehaviorTree.Node) -> BehaviorTree.NodeState:
+        player_pos = Player.GetXY()
+        enemy_array = AgentArray.GetEnemyArray()
+
+        best_agent_id: int = 0
+        best_priority: int = len(priority_names)  # sentinel: lower is better
+
+        for agent_id in enemy_array:
+            if not Agent.IsAlive(agent_id):
+                continue
+            dist = Utils.Distance(player_pos, Agent.GetXY(agent_id))
+            if dist > range_distance:
+                continue
+            agent_name = (Agent.GetNameByID(agent_id) or '').strip().lower()
+            if not agent_name:
+                continue
+            prio = priority_map.get(agent_name, -1)
+            if prio == -1:
+                continue
+            if prio < best_priority:
+                best_priority = prio
+                best_agent_id = agent_id
+
+        if best_agent_id == 0:
+            _dlog(f'{name}: no priority target in range.')
+            return BehaviorTree.NodeState.FAILURE
+
+        # Check if we need to call at all:
+        # skip if current target already IS best_agent_id or has equal/higher priority,
+        # unless the cooldown expired.
+        now_ms = _time.monotonic() * 1000.0
+        current_target_id = Player.GetTargetID() if hasattr(Player, 'GetTargetID') else 0
+        try:
+            current_target_id = Player.GetTargetID()
+        except Exception:
+            current_target_id = 0
+
+        if current_target_id != 0:
+            current_name = (Agent.GetNameByID(current_target_id) or '').strip().lower()
+            current_prio = priority_map.get(current_name, len(priority_names))
+            # No better target and cooldown still active → skip.
+            if best_priority >= current_prio and (now_ms - state['last_call_ms']) < min_call_interval_ms:
+                return BehaviorTree.NodeState.FAILURE
+
+        # Cooldown guard: even if a better target appeared, don't spam.
+        if (now_ms - state['last_call_ms']) < min_call_interval_ms:
+            return BehaviorTree.NodeState.FAILURE
+
+        agent_name = (Agent.GetNameByID(best_agent_id) or '').strip()
+        _dlog(
+            f'{name}: calling target agent_id={best_agent_id} '
+            f'name="{agent_name}" priority={best_priority}.'
+        )
+        Player.ChangeTarget(best_agent_id)
+        Player.Interact(best_agent_id, True)
+        ActionQueueManager().AddAction(
+            'ACTION', Keystroke.PressAndReleaseCombo,
+            [Key.Ctrl.value, Key.Space.value],
+        )
+        state['last_call_ms'] = now_ms
+        return BehaviorTree.NodeState.SUCCESS
+
+    return BehaviorTree(
+        BehaviorTree.ActionNode(
+            name=name,
+            action_fn=_tick,
+            aftercast_ms=0,
+        )
+    )
+
+
+def BuildPriorityTargetService(
+    priority_names: list[str],
+    range_distance: float,
+    service_name: str = 'PriorityTargetService',
+) -> BehaviorTree:
+    """Wrap CallPriorityTarget in a repeating service tree.
+
+    Only ticks while the map is explorable; started/paused gating is
+    already handled by BottingTree._tick_service_tree.
+    Register with botting_tree.AddServiceTree(service_name, lambda: ...) .
+
+    Args:
+        priority_names: Ordered list of enemy display names (highest priority first).
+        range_distance: Search radius in game units.
+        service_name: Node name shown in the BT debug UI.
+    """
+    from Py4GWCoreLib import Map
+
+    # Build the CallPriorityTarget tree ONCE so its internal state
+    # (last_call_ms) persists across ticks.
+    _call_tree = CallPriorityTarget(
+        priority_names=priority_names,
+        range_distance=range_distance,
+        name=service_name,
+    )
+
+    def _tick(node: BehaviorTree.Node) -> BehaviorTree.NodeState:
+        if not Map.IsExplorable():
+            return BehaviorTree.NodeState.RUNNING
+        _call_tree.tick()
+        return BehaviorTree.NodeState.RUNNING
+
+    return BehaviorTree(
+        root=BehaviorTree.RepeaterForeverNode(
+            child=BehaviorTree.ActionNode(
+                name=f'{service_name}Tick',
+                action_fn=_tick,
+            ),
+            name=service_name,
+        )
+    )
+
+
+# ╔══════════════════════════════════════════════════════════════════
+# ║                      PCON UPKEEP SERVICE
+# ╚══════════════════════════════════════════════════════════════════
+
+def BuildPconUpkeepService(
+    mode: str = 'all',
+    send_interval_ms: float = 30_000.0,
+    service_name: str = 'PconUpkeepService',
+) -> BehaviorTree:
+    """Service tree that keeps consumables (pcons/conset) active on all accounts.
+
+    For each configured consumable the service:
+    - Uses the item locally if the effect is no longer active on the leader.
+    - Sends a SharedCommandType.PCon message to every follower on the same map.
+      The receiver's UsePcon handler already guards with Effects.HasEffect, so
+      followers only consume the item when their buff has actually expired.
+
+    *send_interval_ms* throttles how often each message is re-broadcast
+    (default 30 s) so the message queue is not flooded.  Local consumption
+    happens on every tick whenever the local effect is gone — no extra delay.
+
+    Only runs while the map is explorable. BottingTree._tick_service_tree
+    already gates on started=True / paused=False.
+
+    Args:
+        mode: 'all', 'conset', or 'pcons' — passed to consumable_specs().
+        send_interval_ms: Minimum ms between re-sends per consumable.
+        service_name: Node name in the BT debug UI.
+    """
+    import time as _time
+    from Py4GWCoreLib import GLOBAL_CACHE, Map, Player, SharedCommandType
+    from Py4GWCoreLib.routines_src.behaviourtrees_src.botting_consumables import (
+        consumable_specs,
+        normalize_consumable_mode,
+    )
+
+    _mode = normalize_consumable_mode(mode, default='all') or 'all'
+    _specs: list[tuple[int, int]] = []   # (model_id, effect_id) — resolved lazily
+
+    # Per-consumable last-send timestamps: model_id -> float (ms)
+    _last_sent: dict[int, float] = {}
+
+    def _resolve_specs() -> list[tuple[int, int]]:
+        nonlocal _specs
+        if _specs:
+            return _specs
+        result = []
+        for model_id, effect_name in consumable_specs(_mode):
+            effect_id = int(GLOBAL_CACHE.Skill.GetID(effect_name) or 0)
+            result.append((model_id, effect_id))
+        _specs = result
+        return _specs
+
+    def _tick(node: BehaviorTree.Node) -> BehaviorTree.NodeState:
+        if not Map.IsExplorable():
+            return BehaviorTree.NodeState.RUNNING
+
+        now_ms = _time.monotonic() * 1000.0
+        agent_id = Player.GetAgentID()
+
+        # Determine once per tick whether this account should broadcast to followers.
+        try:
+            from Py4GWCoreLib import Party
+            is_leader = bool(Party.IsPartyLeader())
+        except Exception:
+            is_leader = False
+
+        sender = str(Player.GetAccountEmail() or '') if is_leader else ''
+        current_map_id = int(Map.GetMapID() or 0) if is_leader else 0
+
+        for model_id, effect_id in _resolve_specs():
+            # Local consumption: each account handles its own buffs.
+            # Skip if effect_id is unknown (0) to avoid rapid-fire item use.
+            if effect_id > 0:
+                local_active = bool(GLOBAL_CACHE.Effects.HasEffect(agent_id, effect_id))
+                if not local_active:
+                    item_id = int(GLOBAL_CACHE.Inventory.GetFirstModelID(model_id) or 0)
+                    if item_id > 0:
+                        GLOBAL_CACHE.Inventory.UseItem(item_id)
+
+            # Follower broadcast: only the party leader sends, throttled per consumable.
+            if not is_leader:
+                continue
+            last = _last_sent.get(model_id, 0.0)
+            if (now_ms - last) < send_interval_ms:
+                continue
+            _last_sent[model_id] = now_ms
+
+            for account in GLOBAL_CACHE.ShMem.GetAllAccountData():
+                email = str(getattr(account, 'AccountEmail', '') or '')
+                if not email or email == sender:
+                    continue
+                acc_map_obj = getattr(getattr(account, 'AgentData', None), 'Map', None)
+                acc_map = int(
+                    getattr(acc_map_obj, 'MapID', None)
+                    or getattr(account, 'MapID', 0)
+                    or 0
+                )
+                if current_map_id > 0 and acc_map != current_map_id:
+                    continue
+                GLOBAL_CACHE.ShMem.SendMessage(
+                    sender,
+                    email,
+                    SharedCommandType.PCon,
+                    (float(model_id), float(effect_id), 0.0, 0.0),
+                )
+
+        return BehaviorTree.NodeState.RUNNING
+
+    return BehaviorTree(
+        root=BehaviorTree.RepeaterForeverNode(
+            child=BehaviorTree.ActionNode(
+                name=f'{service_name}Tick',
+                action_fn=_tick,
+            ),
+            name=service_name,
+        )
+    )
+
+
+
+def BuildAllyWaitService(
+    max_distance: float = 2000.0,
+    check_interval_ms: float = 500.0,
+    service_name: str = 'AllyWaitService',
+    pause_flag_key: str = 'PAUSE_MOVEMENT',
+) -> BehaviorTree:
+    """Service tree that pauses BT.Move when any alive ally is further than
+    ``max_distance`` from the local player.
+
+    The service writes ``pause_flag_key`` (default ``'PAUSE_MOVEMENT'``) to the
+    shared blackboard every frame.  BT.Move reads that key and stops issuing
+    movement commands while it is True, then resumes automatically once all
+    allies are within range again.
+
+    Allies that have an individual hero flag set are excluded from the distance
+    check — a flagged hero is intentionally sent somewhere else and should not
+    hold up the leader.
+
+    Only active while the map is explorable and the player is alive.
+
+    Args:
+        max_distance: Range in GW units.  Allies beyond this pause movement.
+        check_interval_ms: Minimum ms between distance checks (throttle).
+        service_name: Node name shown in the BT debug/tree view.
+        pause_flag_key: Blackboard key that BT.Move reads; keep the default
+            unless you are using a custom pause key.
+    """
+    import time as _time
+    from Py4GWCoreLib import AgentArray, Agent, Player, Map, Party
+    from Py4GWCoreLib import GLOBAL_CACHE
+    from Py4GWCoreLib.routines_src.Checks import Checks
+
+    state: dict = {'last_check_ms': 0.0, 'paused': False}
+
+    def _is_flagged(ally_id: int) -> bool:
+        """Return True if the ally has a HeroAI flag set (IsFlagged in shared memory)."""
+        try:
+            for account in GLOBAL_CACHE.ShMem.GetAllAccountData():
+                if int(getattr(getattr(account, 'AgentData', None), 'AgentID', 0) or 0) != ally_id:
+                    continue
+                party_pos = int(getattr(getattr(account, 'AgentPartyData', None), 'PartyPosition', -1) or -1)
+                if party_pos < 0:
+                    return False
+                opts = GLOBAL_CACHE.ShMem.GetHeroAIOptionsByPartyNumber(party_pos)
+                return bool(getattr(opts, 'IsFlagged', False)) if opts is not None else False
+        except Exception:
+            pass
+        return False
+
+    def _tick(node: BehaviorTree.Node) -> BehaviorTree.NodeState:
+        if not Map.IsExplorable() or Checks.Player.IsDead():
+            node.blackboard[pause_flag_key] = False
+            state['paused'] = False
+            return BehaviorTree.NodeState.RUNNING
+
+        # Throttled distance check — updates state['paused'] and the blackboard key.
+        now_ms = _time.monotonic() * 1000.0
+        if (now_ms - state['last_check_ms']) >= check_interval_ms:
+            state['last_check_ms'] = now_ms
+
+            self_id = Player.GetAgentID()
+            px, py = Player.GetXY()
+            max_dist_sq = max_distance * max_distance
+
+            ally_too_far = False
+            for ally_id in AgentArray.GetAllyArray():
+                if ally_id == self_id:
+                    continue
+                if not Agent.IsAlive(ally_id):
+                    continue
+                if _is_flagged(ally_id):
+                    continue  # Flagged heroes are intentionally elsewhere — skip.
+                ax, ay = Agent.GetXY(ally_id)
+                dx = ax - px
+                dy = ay - py
+                if (dx * dx + dy * dy) > max_dist_sq:
+                    ally_too_far = True
+                    break
+
+            if ally_too_far != state['paused']:
+                state['paused'] = ally_too_far
+                if ally_too_far:
+                    print(f'[AllyWaitService] Ally too far (>{max_distance:.0f}) - pausing movement.')
+                else:
+                    print('[AllyWaitService] All allies in range - resuming movement.')
+
+            node.blackboard[pause_flag_key] = ally_too_far
+
+        # Every frame: actively cancel movement while paused so that BT.Move
+        # commands issued earlier in the same tick are immediately overridden,
+        # regardless of tick order in the parallel tree.
+        if state['paused']:
+            Player.StopMoving()
+
+        return BehaviorTree.NodeState.RUNNING
+
+    return BehaviorTree(
+        root=BehaviorTree.RepeaterForeverNode(
+            child=BehaviorTree.ActionNode(
+                name=f'{service_name}Tick',
+                action_fn=_tick,
+            ),
+            name=service_name,
+        )
+    )
