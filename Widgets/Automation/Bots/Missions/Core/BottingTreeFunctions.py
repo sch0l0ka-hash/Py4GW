@@ -1615,12 +1615,6 @@ def BuildAllyWaitService(
 
             node.blackboard[pause_flag_key] = ally_too_far
 
-        # Every frame: actively cancel movement while paused so that BT.Move
-        # commands issued earlier in the same tick are immediately overridden,
-        # regardless of tick order in the parallel tree.
-        if state['paused']:
-            Player.StopMoving()
-
         return BehaviorTree.NodeState.RUNNING
 
     return BehaviorTree(

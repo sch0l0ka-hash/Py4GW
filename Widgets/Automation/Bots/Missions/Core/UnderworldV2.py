@@ -46,6 +46,29 @@ initialized = False
 INI_KEY = ""
 botting_tree: BottingTree | None = None
 
+# ── Run tracking state ────────────────────────────────────────────────────────
+_run_count: int = 0
+_run_start_ms: float = 0.0
+_last_tracked_step: str = ''
+_run_tracking_initialized: bool = False
+
+# ── Team assignments: email -> 1 | 2 | 0 (unassigned) ────────────────────────
+_team_assignments: dict[str, int] = {}
+
+
+def _load_team_assignments() -> None:
+    ini = IniManager()
+    for acc in GLOBAL_CACHE.ShMem.GetAllAccountData(sort_results=False):
+        email = str(getattr(acc, 'AccountEmail', '') or '').strip()
+        if email:
+            _team_assignments[email] = int(ini.getInt(INI_KEY, f'team_{email}', 0))
+
+
+def _save_team_assignment(email: str, team: int) -> None:
+    ini = IniManager()
+    ini.set(INI_KEY, f'team_{email}', team)
+    ini.save_vars(INI_KEY)
+
 
 # ╔══════════════════════════════════════════════════════════════════
 # ║                       BOT CONFIGURATION
@@ -1122,6 +1145,116 @@ def _add_config_vars():
 
 
 # ╔══════════════════════════════════════════════════════════════════
+# ║                       RUN TRACKING
+# ╚══════════════════════════════════════════════════════════════════
+
+def _update_run_tracking() -> None:
+    global _run_count, _run_start_ms, _last_tracked_step, _run_tracking_initialized
+    if botting_tree is None or not botting_tree.IsStarted():
+        return
+    current_step = str(botting_tree.GetBlackboardValue('current_step_name', '') or '')
+    if not current_step:
+        return
+    if not _run_tracking_initialized:
+        _run_tracking_initialized = True
+        _last_tracked_step = current_step
+        if current_step == 'PrepareOutpost':
+            _run_count = max(_run_count, 1)
+            _run_start_ms = time.monotonic() * 1000.0
+        return
+    # New run detected: step cycled back to PrepareOutpost from somewhere later.
+    if current_step == 'PrepareOutpost' and _last_tracked_step not in ('', 'PrepareOutpost'):
+        _run_count += 1
+        _run_start_ms = time.monotonic() * 1000.0
+    _last_tracked_step = current_step
+
+
+def _get_step_states() -> list[tuple[str, object]]:
+    """Return [(display_name, NodeState | None)] for every planner step."""
+    if botting_tree is None:
+        return []
+    planner_tree = getattr(botting_tree, 'planner_tree', None)
+    if planner_tree is None or getattr(planner_tree, 'root', None) is None:
+        return []
+    result = []
+    for step_wrapper in (getattr(planner_tree.root, 'children', None) or []):
+        name = step_wrapper.name
+        if name.startswith('Step: '):
+            name = name[6:]
+        result.append((name, getattr(step_wrapper, 'last_state', None)))
+    return result
+
+
+def _draw_main_override(
+    main_child_dimensions: tuple[int, int],
+    icon_path: str,
+    iconwidth: int,
+) -> None:
+    from Py4GWCoreLib.py4gwcorelib_src.BehaviorTree import BehaviorTree as _BT
+    NodeState = _BT.NodeState
+
+    if botting_tree is None:
+        PyImGui.text('Not initialized.')
+        return
+
+    _update_run_tracking()
+
+    # ── Header: icon + live status ────────────────────────────────────────────
+    if PyImGui.begin_table('uwv2_main_header', 2, PyImGui.TableFlags.RowBg | PyImGui.TableFlags.BordersOuterH):
+        PyImGui.table_setup_column('Icon', PyImGui.TableColumnFlags.WidthFixed, float(iconwidth))
+        PyImGui.table_setup_column('Info', PyImGui.TableColumnFlags.WidthStretch)
+        PyImGui.table_next_row()
+        PyImGui.table_set_column_index(0)
+        botting_tree.UI._draw_texture(icon_path, (float(iconwidth), float(iconwidth)))
+        PyImGui.table_set_column_index(1)
+
+        PyImGui.text(BOT_NAME)
+
+        # Current step – color-coded by bot state.
+        current_step = str(botting_tree.GetBlackboardValue('current_step_name', '') or 'Idle')
+        if not botting_tree.IsStarted():
+            step_color = (130, 130, 130, 255)
+        elif botting_tree.IsPaused():
+            step_color = (180, 180, 50, 255)
+        else:
+            step_color = (255, 220, 0, 255)
+        PyImGui.text_colored(f'Step: {current_step}', step_color)
+
+        # Run counter + elapsed time.
+        now_ms = time.monotonic() * 1000.0
+        elapsed_s = (now_ms - _run_start_ms) / 1000.0 if (_run_start_ms > 0 and botting_tree.IsStarted()) else 0.0
+        h, m, s = int(elapsed_s // 3600), int((elapsed_s % 3600) // 60), int(elapsed_s % 60)
+        PyImGui.text(f'Run #{_run_count}   {h:02d}:{m:02d}:{s:02d}')
+
+        PyImGui.end_table()
+
+    # ── Start / Stop / Pause buttons ─────────────────────────────────────────
+    if botting_tree.IsStarted():
+        if PyImGui.button('Stop##UWv2Stop'):
+            botting_tree.Stop()
+        PyImGui.same_line(0, -1)
+        if botting_tree.IsPaused():
+            if PyImGui.button('Resume##UWv2Pause'):
+                botting_tree.Pause(False)
+        else:
+            if PyImGui.button('Pause##UWv2Pause'):
+                botting_tree.Pause(True)
+    else:
+        step_names = botting_tree.GetNamedPlannerStepNames()
+        if step_names:
+            ui = botting_tree.UI
+            ui._selected_start_index = max(0, min(ui._selected_start_index, len(step_names) - 1))
+            ui._selected_start_index = PyImGui.combo('Start At##uwv2', ui._selected_start_index, step_names)
+            if PyImGui.button('Start##UWv2Start'):
+                botting_tree.RestartFromNamedPlannerStep(step_names[ui._selected_start_index], auto_start=True)
+        else:
+            if PyImGui.button('Start##UWv2Start'):
+                botting_tree.Start()
+
+    PyImGui.separator()
+
+
+# ╔══════════════════════════════════════════════════════════════════
 # ║                       SETTINGS HELPERS
 # ╚══════════════════════════════════════════════════════════════════
 
@@ -1139,55 +1272,114 @@ def GetSelectedEntrypoint() -> tuple[str, int]:
 
 
 def _draw_settings_tab() -> None:
-    """Custom Settings tab: replicates the BottingTree default options and
-    adds an UW-specific entry-outpost combobox."""
+    """Custom Settings tab: grouped options for bot control, UW run, and debug."""
+    global _run_count, _run_start_ms, _run_tracking_initialized, _last_tracked_step
     if botting_tree is None:
         return
 
-    # ── Default BottingTree settings ─────────────────────────────────────────
-    botting_tree.pause_on_combat = PyImGui.checkbox(
-        "Pause Planner On Combat", botting_tree.pause_on_combat
-    )
-
-    headless = PyImGui.checkbox("Headless HeroAI", botting_tree.IsHeadlessHeroAIEnabled())
-    if headless != botting_tree.IsHeadlessHeroAIEnabled():
-        botting_tree.SetHeadlessHeroAIEnabled(headless, reset_runtime=False)
-
-    looting = PyImGui.checkbox("Looting", botting_tree.IsLootingEnabled())
-    if looting != botting_tree.IsLootingEnabled():
-        botting_tree.SetLootingEnabled(looting)
-
-    isolation = PyImGui.checkbox("Account Isolation", botting_tree.IsIsolationEnabled())
-    if isolation != botting_tree.IsIsolationEnabled():
-        botting_tree.SetIsolationEnabled(isolation)
-
-    PyImGui.separator()
-    botting_tree.DrawMovePathDebugOptions()
-    # ── Debug ───────────────────────────────────────────────────────────────────────
-    PyImGui.separator()
     ini = IniManager()
-    debug_enabled = bool(ini.getBool(INI_KEY, "debug_logging", False))
-    new_debug = PyImGui.checkbox("Verbose Debug Logging", debug_enabled)
-    if new_debug != debug_enabled:
-        ini.set(INI_KEY, "debug_logging", new_debug)
-        ini.save_vars(INI_KEY)
-        BTF.SetDebugLogging(new_debug)
-    # ── UW-specific options ──────────────────────────────────────────────────
+
+    # ── Underworld Run ────────────────────────────────────────────────────────
+    PyImGui.spacing()
+    PyImGui.text('Underworld Run')
     PyImGui.separator()
-    PyImGui.text("Underworld Run")
 
     entrypoint_keys   = list(UW_ENTRYPOINTS.keys())
     entrypoint_labels = [label for label, _ in UW_ENTRYPOINTS.values()]
     current_key = GetSelectedEntrypointKey()
     current_idx = entrypoint_keys.index(current_key) if current_key in entrypoint_keys else 0
 
-    PyImGui.text("Entry Outpost:")
-    new_idx = PyImGui.combo("##uwv2_entrypoint", current_idx, entrypoint_labels)
+    PyImGui.text('Entry Outpost:')
+    new_idx = PyImGui.combo('##uwv2_entrypoint', current_idx, entrypoint_labels)
     if new_idx != current_idx and 0 <= new_idx < len(entrypoint_keys):
         new_key = entrypoint_keys[new_idx]
-        ini = IniManager()
-        ini.set(INI_KEY, "entrypoint", new_key)
+        ini.set(INI_KEY, 'entrypoint', new_key)
         ini.save_vars(INI_KEY)
+
+
+
+# ╔══════════════════════════════════════════════════════════════════
+# ║                       TEAM TAB
+# ╚══════════════════════════════════════════════════════════════════
+
+def _draw_team_tab() -> None:
+    """'Team' tab: live overview of all active accounts from shared memory."""
+    try:
+        accounts = GLOBAL_CACHE.ShMem.GetAllAccountData(sort_results=True)
+    except Exception:
+        PyImGui.text('Shared memory not available.')
+        return
+
+    if not accounts:
+        PyImGui.text('No accounts found in shared memory.')
+        return
+
+    col_flags = (
+        PyImGui.TableFlags.RowBg
+        | PyImGui.TableFlags.BordersInnerV
+        | PyImGui.TableFlags.BordersOuterH
+    )
+    if not PyImGui.begin_table('uwv2_team', 3, col_flags):
+        return
+
+    PyImGui.table_setup_column('Character', PyImGui.TableColumnFlags.WidthStretch)
+    PyImGui.table_setup_column('Team 1',    PyImGui.TableColumnFlags.WidthFixed, 54.0)
+    PyImGui.table_setup_column('Team 2',    PyImGui.TableColumnFlags.WidthFixed, 54.0)
+    PyImGui.table_headers_row()
+
+    own_email = Player.GetAccountEmail() or ''
+
+    for acc in accounts:
+        char_name = str(getattr(getattr(acc, 'AgentData', None), 'CharacterName', '') or '').strip()
+        if not char_name:
+            continue
+
+        email = str(getattr(acc, 'AccountEmail', '') or '').strip()
+        if not email:
+            continue
+
+        is_self   = (email == own_email)
+        # Own account is locked to Team 1.
+        current   = 1 if is_self else _team_assignments.get(email, 0)
+
+        PyImGui.table_next_row()
+
+        # ── Character name ────────────────────────────────────────────
+        PyImGui.table_set_column_index(0)
+        name_color = (255, 220, 80, 255) if is_self else (220, 220, 220, 255)
+        PyImGui.text_colored(char_name, name_color)
+
+        # ── Team 1 checkbox ───────────────────────────────────────────
+        PyImGui.table_set_column_index(1)
+        if is_self:
+            PyImGui.begin_disabled(True)
+            PyImGui.checkbox(f'##t1_{email}', True)
+            PyImGui.end_disabled()
+        else:
+            t1 = PyImGui.checkbox(f'##t1_{email}', current == 1)
+            if t1 and current != 1:
+                _team_assignments[email] = 1
+                _save_team_assignment(email, 1)
+            elif not t1 and current == 1:
+                _team_assignments[email] = 0
+                _save_team_assignment(email, 0)
+
+        # ── Team 2 checkbox ───────────────────────────────────────────
+        PyImGui.table_set_column_index(2)
+        if is_self:
+            PyImGui.begin_disabled(True)
+            PyImGui.checkbox(f'##t2_{email}', False)
+            PyImGui.end_disabled()
+        else:
+            t2 = PyImGui.checkbox(f'##t2_{email}', current == 2)
+            if t2 and current != 2:
+                _team_assignments[email] = 2
+                _save_team_assignment(email, 2)
+            elif not t2 and current == 2:
+                _team_assignments[email] = 0
+                _save_team_assignment(email, 0)
+
+    PyImGui.end_table()
 
 
 # ╔══════════════════════════════════════════════════════════════════
@@ -1299,9 +1491,15 @@ def main():
                 return
             _add_config_vars()
             IniManager().load_once(INI_KEY)
+            try:
+                _load_team_assignments()
+            except Exception:
+                pass
 
         botting_tree = BottingTree(BOT_NAME, isolation_enabled=False)
-        # Suppress the status bool rows (Started/Paused/etc.) from the Main tab.
+        # Replace the Main tab content with the custom UW run overview.
+        botting_tree.UI._draw_main_child = lambda dims, icon, width: _draw_main_override(dims, icon, width)
+        # Suppress the fallback status bool rows (no longer used by the override).
         botting_tree.UI._colored_bool = lambda label, value: None
         botting_tree.SetNamedPlannerSteps(
             _get_sequence_builders(),
@@ -1336,7 +1534,7 @@ def main():
             main_child_dimensions=(450, 450),
             icon_path=MODULE_ICON,
             iconwidth=128,
-            extra_tabs=[('Tree', _draw_subtree_tab)],
+            extra_tabs=[('Team', _draw_team_tab), ('Tree', _draw_subtree_tab)],
         )
 
 
