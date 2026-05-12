@@ -703,6 +703,55 @@ def _build_enter_underworld_tree() -> BehaviorTree:
     )
 
 
+def _force_local_account_skills_on(
+    *, name: str = "ForceLocalSkillsOn"
+) -> BehaviorTree:
+    """Force every HeroAI skill slot of the local account to ``True`` in
+    shared memory.
+
+    ``RestoreHeroAIOptions`` only forces ``Combat/Following/Avoidance/Targeting``
+    on bot start; per-slot ``Skills[i]`` toggles persist from the HeroAI
+    widget (Shift+Click on a skill slot in the HeroAI UI flips them).  If any
+    slot is left ``False`` for the active character, headless HeroAI will
+    silently never cast that slot, even though the planner thinks Combat is
+    enabled.  This helper re-enables every slot once per run.
+
+    Returns RUNNING until the account email is available + the write
+    succeeds, then SUCCESS so the sequence advances.
+    """
+
+    state: dict = {"done": False}
+
+    def _tick(node: BehaviorTree.Node) -> BehaviorTree.NodeState:
+        if state["done"]:
+            return BehaviorTree.NodeState.SUCCESS
+
+        account_email = Player.GetAccountEmail()
+        if not account_email:
+            return BehaviorTree.NodeState.RUNNING
+
+        try:
+            options = GLOBAL_CACHE.ShMem.GetHeroAIOptionsFromEmail(account_email)
+        except Exception:
+            options = None
+        if options is None:
+            return BehaviorTree.NodeState.RUNNING
+
+        try:
+            for slot in range(len(options.Skills)):
+                options.Skills[slot] = True
+            GLOBAL_CACHE.ShMem.SetHeroAIOptionsByEmail(account_email, options)
+        except Exception:
+            return BehaviorTree.NodeState.RUNNING
+
+        state["done"] = True
+        return BehaviorTree.NodeState.SUCCESS
+
+    return BehaviorTree(
+        root=BehaviorTree.ActionNode(name=name, action_fn=_tick)
+    )
+
+
 def _build_chamber_tree() -> BehaviorTree:
     """Chamber: talk to the Lost Soul to pick up the first quest
     ("Clear the Chamber"), then walk the chamber clearing path to pull
@@ -712,6 +761,7 @@ def _build_chamber_tree() -> BehaviorTree:
             name="Chamber",
             children=[
                 BT.WaitUntilOnExplorable(timeout_ms=60_000).root,
+                _force_local_account_skills_on().root,
                 BT.Move([Vec2f(281,7229)], pause_on_combat=True).root,
                 BT.MoveAndAutoDialogByModelID(LOST_SOUL_MODEL_ID).root,
                 BT.Move(CHAMBER_PATH, pause_on_combat=True).root,
