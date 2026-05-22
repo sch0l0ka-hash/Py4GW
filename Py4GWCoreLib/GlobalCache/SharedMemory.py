@@ -215,6 +215,13 @@ class Py4GWSharedMemoryManager:
         if resolved_party_id <= 0:
             return []
 
+        local_map_signature = (
+            int(Map.GetMapID() or 0),
+            int(Map.GetRegion()[0] or 0),
+            int(Map.GetDistrict() or 0),
+            int(Map.GetLanguage()[0] or 0),
+        )
+
         entries: list[tuple[int, int]] = []
         seen_keys: set[tuple[str, int, int]] = set()
         for account in self.GetAllActiveSlotsData():
@@ -225,6 +232,14 @@ class Py4GWSharedMemoryManager:
             if not (account.IsAccount or account.IsHero):
                 continue
             if int(getattr(account.AgentPartyData, "PartyID", 0) or 0) != resolved_party_id:
+                continue
+            account_map_signature = (
+                int(getattr(getattr(account.AgentData, "Map", None), "MapID", 0) or 0),
+                int(getattr(getattr(account.AgentData, "Map", None), "Region", 0) or 0),
+                int(getattr(getattr(account.AgentData, "Map", None), "District", 0) or 0),
+                int(getattr(getattr(account.AgentData, "Map", None), "Language", 0) or 0),
+            )
+            if account_map_signature != local_map_signature:
                 continue
 
             agent_id = int(getattr(account.AgentData, "AgentID", 0) or 0)
@@ -252,12 +267,13 @@ class Py4GWSharedMemoryManager:
         return entries
 
     @frame_cache(category="SharedMemory", source_lib="GetSharedPartyMinMorale")
-    def GetSharedPartyMinMorale(self, party_id: int | None = None) -> int:
-        """Return the minimum shared-memory morale for current-party players and heroes only."""
+    def GetSharedPartyMinMorale(self, party_id: int | None = None) -> int | None:
+        """Return the minimum positive shared-memory morale for current-party players and heroes only."""
         entries = self.GetSharedPartyMorale(party_id=party_id)
-        if not entries:
-            return int(Player.GetMorale() or 0)
-        return min(int(morale) for _, morale in entries)
+        valid_morale = [int(morale) for _, morale in entries if int(morale or 0) > 0]
+        if not valid_morale:
+            return None
+        return min(valid_morale)
     
     @frame_cache(category="SharedMemory", source_lib="GetAllActivePlayers")
     def GetAllAccountData(self, sort_results: bool = True, include_isolated: bool = False) -> list[AccountStruct]:
@@ -290,6 +306,49 @@ class Py4GWSharedMemoryManager:
     def AccountHasEffect(self, account_email: str, effect_id: int) -> bool:
         """Check if the account with the given email has the specified effect."""
         return self.GetAllAccounts().AccountHasEffect(account_email, effect_id)
+
+    @frame_cache(category="SharedMemory", source_lib="GetAccountInventoryEntries")
+    def GetAccountInventoryEntries(self, account_email: str) -> list[tuple[int, int, int, int]]:
+        """
+        Return shared-memory inventory entries for one account as:
+        `(bag_id, slot, model_id, quantity)`.
+        """
+        account = self.GetAccountDataFromEmail(account_email)
+        if account is None:
+            return []
+
+        entries: list[tuple[int, int, int, int]] = []
+        for bag in account.InventoryBags.iter_bags():
+            bag_id = int(getattr(bag, "BagID", 0) or 0)
+            bag_size = int(getattr(bag, "Size", 0) or 0)
+            if bag_id <= 0 or bag_size <= 0:
+                continue
+            for slot_index in range(min(bag_size, len(bag.Slots))):
+                slot = bag.Slots[slot_index]
+                model_id = int(getattr(slot, "ModelID", 0) or 0)
+                quantity = int(getattr(slot, "Quantity", 0) or 0)
+                if model_id <= 0 or quantity <= 0:
+                    continue
+                entries.append((bag_id, int(getattr(slot, "Slot", slot_index) or slot_index), model_id, quantity))
+        return entries
+
+    @frame_cache(category="SharedMemory", source_lib="GetAccountInventoryModelCount")
+    def GetAccountInventoryModelCount(self, account_email: str, model_id: int) -> int:
+        """Return the total shared-memory quantity for one model in one account inventory."""
+        total = 0
+        target_model_id = int(model_id or 0)
+        if target_model_id <= 0:
+            return 0
+        for _bag_id, _slot, entry_model_id, quantity in self.GetAccountInventoryEntries(account_email):
+            if int(entry_model_id) != target_model_id:
+                continue
+            total += int(quantity or 0)
+        return total
+
+    @frame_cache(category="SharedMemory", source_lib="AccountHasInventoryModel")
+    def AccountHasInventoryModel(self, account_email: str, model_id: int, min_quantity: int = 1) -> bool:
+        """Return whether the account inventory has at least `min_quantity` of `model_id`."""
+        return self.GetAccountInventoryModelCount(account_email, model_id) >= max(1, int(min_quantity or 1))
 
     #region HeroAI
     @frame_cache(category="SharedMemory", source_lib="GetAllAccountHeroAIOptions")

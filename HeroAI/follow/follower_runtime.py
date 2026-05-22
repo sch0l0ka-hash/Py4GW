@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from Py4GWCoreLib import ActionQueueManager, Agent, GLOBAL_CACHE, Range, Utils, Weapon
+from Py4GWCoreLib import ActionQueueManager, Agent, GLOBAL_CACHE, Range, SharedCommandType, Utils, Weapon
 from Py4GWCoreLib.Map import Map
 from Py4GWCoreLib.Player import Player
 from Py4GWCoreLib.enums_src.UI_enums import ControlAction
@@ -10,6 +10,12 @@ from Py4GWCoreLib.UIManager import UIManager
 from Py4GWCoreLib.py4gwcorelib_src.BehaviorTree import BehaviorTree
 
 from ..cache_data import CacheData
+from .smart_unstuck import (
+    SMART_UNSTUCK_CFG,
+    SmartUnstuckState,
+    reset_smart_unstuck,
+    update_smart_unstuck,
+)
 
 
 @dataclass(slots=True)
@@ -19,34 +25,78 @@ class FollowExecutionState:
     follow_map_entry_signature: tuple[int, int, int, int, int] | None = None
     last_leader_publish_signature: tuple[int, int, int, int, int] | None = None
     recovery_active: bool = False
+    pet_recovery_notified: bool = False
+    stuck: SmartUnstuckState = field(default_factory=SmartUnstuckState)
 
 
-FOLLOW_RECOVERY_START_DISTANCE = max(float(Range.Spellcast.value), float(Range.SafeCompass.value) * 0.85)
-FOLLOW_RECOVERY_RELEASE_DISTANCE = max(
-    float(Range.Spellcast.value),
-    FOLLOW_RECOVERY_START_DISTANCE - 700.0,
-)
+FOLLOW_RECOVERY_DISTANCE = 4000.0
+FOLLOW_RECOVERY_START_DISTANCE = FOLLOW_RECOVERY_DISTANCE
+FOLLOW_RECOVERY_RELEASE_DISTANCE = Range.Spellcast.value
 
 
 def get_follow_destination_distance(cached_data: CacheData) -> float:
+    destination = get_follow_destination_xy(cached_data)
+    if destination is None:
+        return 0.0
+    return float(Utils.Distance(destination, Agent.GetXY(Player.GetAgentID())))
+
+
+def get_follow_destination_xy(cached_data: CacheData) -> tuple[float, float] | None:
     account = GLOBAL_CACHE.ShMem.GetAccountDataFromEmail(cached_data.account_email)
     options = GLOBAL_CACHE.ShMem.GetHeroAIOptionsFromEmail(cached_data.account_email)
 
     if not account or not options:
-        return 0.0
+        return None
 
     if bool(getattr(options, "IsFlagged", False)):
         if int(account.AgentPartyData.PartyPosition) == 0:
-            destination = (float(options.AllFlag.x), float(options.AllFlag.y))
+            return (float(options.AllFlag.x), float(options.AllFlag.y))
         else:
-            destination = (float(options.FlagPos.x), float(options.FlagPos.y))
+            return (float(options.FlagPos.x), float(options.FlagPos.y))
     else:
         leader_agent_id = int(GLOBAL_CACHE.Party.GetPartyLeaderID())
         if leader_agent_id <= 0:
-            return 0.0
-        destination = Agent.GetXY(leader_agent_id)
+            return None
+        return Agent.GetXY(leader_agent_id)
 
-    return float(Utils.Distance(destination, Agent.GetXY(Player.GetAgentID())))
+
+def _notify_recovery_console_message(message_text: str) -> None:
+    sender_email = str(Player.GetAccountEmail() or "").strip()
+    leader_account = GLOBAL_CACHE.ShMem.GetAccountDataFromPartyNumber(0)
+    leader_email = str(getattr(leader_account, "AccountEmail", "") or "").strip() if leader_account else ""
+    if sender_email and leader_email and sender_email != leader_email:
+        GLOBAL_CACHE.ShMem.SendMessage(
+            sender_email,
+            leader_email,
+            SharedCommandType.ConsoleMessage,
+            (0, 0, 0, 0),
+            (message_text,),
+        )
+
+
+def _maybe_notify_pet_recovery(cached_data: CacheData, state: FollowExecutionState) -> None:
+    player_agent_id = int(Player.GetAgentID())
+    pet_id = int(GLOBAL_CACHE.Party.Pets.GetPetID(player_agent_id) or 0)
+    if pet_id <= 0 or not Agent.IsValid(pet_id):
+        state.pet_recovery_notified = False
+        return
+
+    destination = get_follow_destination_xy(cached_data)
+    if destination is None:
+        state.pet_recovery_notified = False
+        return
+
+    pet_x, pet_y = Agent.GetXY(pet_id)
+    pet_distance = float(Utils.Distance(destination, (pet_x, pet_y)))
+    if pet_distance < float(FOLLOW_RECOVERY_START_DISTANCE):
+        state.pet_recovery_notified = False
+        return
+
+    if state.pet_recovery_notified:
+        return
+
+    _notify_recovery_console_message(f"pet lagged behind at x={pet_x:.0f}, y={pet_y:.0f}")
+    state.pet_recovery_notified = True
 
 
 def is_follow_recovery_active(cached_data: CacheData, state: FollowExecutionState) -> bool:
@@ -60,7 +110,10 @@ def is_follow_recovery_active(cached_data: CacheData, state: FollowExecutionStat
         or player_agent_id == int(GLOBAL_CACHE.Party.GetPartyLeaderID())
     ):
         state.recovery_active = False
+        state.pet_recovery_notified = False
         return False
+
+    _maybe_notify_pet_recovery(cached_data, state)
 
     distance_to_destination = get_follow_destination_distance(cached_data)
     if state.recovery_active:
@@ -72,7 +125,7 @@ def is_follow_recovery_active(cached_data: CacheData, state: FollowExecutionStat
 
     state.recovery_active = True
     try:
-        Player.SendChat('#', 'Hey, Wait for me!.')
+        _notify_recovery_console_message("Hey, Wait for me!")
     except Exception:
         pass
     return True
@@ -88,6 +141,7 @@ def execute_follower_follow(
     def _reset_follow_runtime() -> None:
         state.last_follow_move_point = None
         state.last_follow_assigned_point = None
+        reset_smart_unstuck(state.stuck)
 
     def _account_map_signature(account) -> tuple[int, int, int, int, int] | None:
         if account is None or not bool(getattr(account, "IsSlotActive", False)):
@@ -117,6 +171,18 @@ def execute_follower_follow(
     if not options or not options.Following:
         state.recovery_active = False
         return BehaviorTree.NodeState.FAILURE
+
+    # During an active stuck-avoidance detour, BT.Move needs to tick at the
+    # full HeroAI BT rate (~33ms) so it can detect "almost there" mid-walk and
+    # switch the engine target BEFORE the follower physically arrives at a
+    # waypoint. Apo's "constantly steer" — at the previous 100ms throttle the
+    # follower covered an entire 89u waypoint between BT ticks, so BT only
+    # ever sampled the player at arrival moments and tolerance had no effect.
+    # Idle mode keeps the 250ms throttle since smoothness doesn't matter there.
+    if state.stuck.mode != "idle":
+        cached_data.follow_throttle_timer.SetThrottleTime(0)
+    else:
+        cached_data.follow_throttle_timer.SetThrottleTime(250)
 
     if not cached_data.follow_throttle_timer.IsExpired():
         return BehaviorTree.NodeState.FAILURE
@@ -188,7 +254,7 @@ def execute_follower_follow(
             _reset_follow_runtime()
             return BehaviorTree.NodeState.FAILURE
 
-    combat_active = bool(cached_data.data.in_aggro)
+    combat_active = bool(cached_data.IsHeadlessCombatPauseActive())
     is_melee = cached_data.data.weapon_type in {
         Weapon.Axe.value,
         Weapon.Hammer.value,
@@ -222,8 +288,31 @@ def execute_follower_follow(
         state.last_follow_move_point = None
     state.last_follow_assigned_point = assigned_point
 
+    # Upstream "follow recovery": when the follower is far from its destination,
+    # tighten the tolerance to FOLLOW_RECOVERY_RELEASE_DISTANCE so it keeps
+    # closing the gap instead of stopping at the normal slot threshold.
     effective_follow_distance = min(follow_distance, FOLLOW_RECOVERY_RELEASE_DISTANCE) if recovery_active else follow_distance
     if Utils.Distance((follow_x, follow_y), Player.GetXY()) <= effective_follow_distance:
+        reset_smart_unstuck(state.stuck)
+        return BehaviorTree.NodeState.FAILURE
+
+    if follow_z == 0 and not own_flag_active:
+        update_smart_unstuck(
+            state.stuck,
+            SMART_UNSTUCK_CFG,
+            current_xy=Player.GetXY(),
+            follow_xy=(follow_x, follow_y),
+            assigned_changed=assigned_changed,
+        )
+    else:
+        reset_smart_unstuck(state.stuck)
+
+    # During an active detour, BT.Move has already issued Player.Move with its
+    # own stall-aware pacing. Skip our Player.Move below — otherwise we clobber
+    # the in-flight pathing and reintroduce inter-waypoint stutter.
+    if state.stuck.mode != "idle":
+        state.last_follow_move_point = None
+        cached_data.follow_throttle_timer.Reset()
         return BehaviorTree.NodeState.FAILURE
 
     xx = follow_x
