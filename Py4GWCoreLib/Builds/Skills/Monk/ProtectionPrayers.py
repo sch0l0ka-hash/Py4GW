@@ -124,3 +124,35 @@ class ProtectionPrayers:
             reversal_of_fortune_id,
             target_agent_id,
         ))
+    #endregion
+
+    #region S
+    def Spirit_Bond(self, *, health_threshold: float = 0.90, require_aggro: bool = True) -> BuildCoroutine:
+        spirit_bond_id: int = Skill.GetID("Spirit_Bond")
+        health_threshold = max(0.0, min(1.0, float(health_threshold)))
+
+        def _resolve_spirit_bond_target() -> int:
+            return self.build.ResolveRankedPartyAllyTarget(
+                spirit_bond_id,
+                self.build.GetCustomSkill(spirit_bond_id),
+                validator=lambda agent_id: (
+                    Agent.GetHealth(agent_id) < health_threshold
+                    and not Routines.Checks.Effects.HasBuff(agent_id, spirit_bond_id)
+                ),
+                rank_key=lambda agent_id: Agent.GetHealth(agent_id),
+            )
+
+        if not self.build.IsSkillEquipped(spirit_bond_id):
+            return False
+        if require_aggro and not self.build.IsInAggro():
+            return False
+
+        target_agent_id = _resolve_spirit_bond_target()
+        if not target_agent_id:
+            return False
+
+        return (yield from self.build.CastSkillIDAndRestoreTarget(
+            spirit_bond_id,
+            target_agent_id,
+        ))
+    #endregion
